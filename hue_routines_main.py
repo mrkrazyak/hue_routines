@@ -18,17 +18,29 @@ parser = argparse.ArgumentParser(description="Hue Routines")
 parser.add_argument("--debug", help="enable debug logging", action="store_true")
 args = parser.parse_args()
 
+
+# light rules
+
+evening_scene_switchover_time = "20:30"  # 8:30 pm
+
 bathroom_update_time_secs = 60 * 1  # minutes
 
 weather_update_time_secs = 60 * 5  # minutes
 weather_transition_time_ms = 1000 * 3  # seconds
 
-evening_scene_switchover_time = "20:30"  # 8:30 pm
+# display difference in inside/outside temp
+weather_temp_diff_range = 3  # degrees fahrenheit
+weather_temp_brightness_diff = -20  # change in brightness at beginning of animation
+weather_temp_wait_time_secs = 10  # show temp diff color for this long
+# scene names
+weather_temp_colder_scene = "colder"
+weather_temp_same_scene = "same"
+weather_temp_hotter_scene = "hotter"
 
 
 async def main():
     """
-    Run this shit.
+    Run it.
     First make a separate hue_config.py file with your own variables/secrets.
     """
     if args.debug:
@@ -78,21 +90,65 @@ async def weather_light_routine(bridge):
     # run routine
     while True:
         try:
+            # if weather scene isn't on, don't do anything
             weather_zone_state = bridge.groups.grouped_light.get(weather_group_id)
             weather_zone_is_on = weather_zone_state.on.on
             logging.debug(f"weather_zone_is_on: {weather_zone_is_on}")
 
             if weather_zone_is_on:
-                prev_weather_zone_brigtness = weather_zone_state.dimming.brightness
-                logging.debug(f"weather_zone_brightness: {prev_weather_zone_brigtness}")
+                prev_weather_zone_brightness = weather_zone_state.dimming.brightness
+                logging.debug(f"weather_zone_brightness: {prev_weather_zone_brightness}")
 
                 response = requests.get(
-                    f"https://api.openweathermap.org/data/2.5/weather?q={city_name}&appid={weather_api_key}&units=imperial")
+                    "https://api.openweathermap.org/data/2.5/weather"
+                    f"?q={city_name}"
+                    f"&appid={weather_api_key}"
+                    "&units=imperial")
                 response.raise_for_status()
 
                 cur_weather = str(response.json().get("weather")[0].get("main")).lower()
                 logging.debug(f"current weather: {cur_weather}")
 
+                # animate lights for inside/outside temp difference
+                try:
+                    inside_temp = get_inside_temp_in_f(bridge)
+                    # feels like temp
+                    outside_temp = response.json().get("main").get("feels_like")
+                    logging.debug(f"outside temp: {outside_temp}")
+
+                    upper_range = inside_temp + weather_temp_diff_range
+                    lower_range = inside_temp - weather_temp_diff_range
+                    if outside_temp < lower_range:
+                        logging.debug(f"outside temp is lower than {lower_range} degrees")
+                        temp_scene = weather_temp_colder_scene
+                    elif outside_temp > upper_range:
+                        logging.debug(f"outside temp is higher than {upper_range} degrees")
+                        temp_scene = weather_temp_hotter_scene
+                    else:
+                        # outside temp close to inside
+                        logging.debug(f"outside temp is close to inside temp")
+                        temp_scene = weather_temp_same_scene
+
+                    start_brightness = prev_weather_zone_brightness + weather_temp_brightness_diff
+                    temp_scene_id = weather_scene_map.get(temp_scene)
+                    if temp_scene_id is None:
+                        raise Exception(f"could not find scene named '{temp_scene}'")
+
+                    # show color for temp diff, dim slightly
+                    await bridge.scenes.recall(temp_scene_id,
+                                               duration=weather_transition_time_ms,
+                                               brightness=start_brightness)
+                    await asyncio.sleep(1)
+                    # bring back to same brightness as before
+                    await bridge.scenes.recall(temp_scene_id,
+                                               duration=weather_transition_time_ms,
+                                               brightness=prev_weather_zone_brightness)
+                    await asyncio.sleep(10)
+
+                except Exception as ex:
+                    logging.debug(msg=f"error changing light for inside/outside temp difference", exc_info=ex)
+
+                # change to scene for current weather
                 scene_id = weather_scene_map.get(cur_weather)
                 if scene_id is None:
                     logging.debug(f"no scene named '{cur_weather}' in weather scene map")
@@ -101,7 +157,9 @@ async def weather_light_routine(bridge):
 
                 if scene_id is not None:
                     # turn on correct weather scene and don't change brightness
-                    await bridge.scenes.recall(scene_id, brightness=prev_weather_zone_brigtness)
+                    await bridge.scenes.recall(scene_id,
+                                               duration=weather_transition_time_ms,
+                                               brightness=prev_weather_zone_brightness)
                 else:
                     logging.debug(f"no scene named default in weather scene map, not changing weather light")
 
@@ -109,6 +167,38 @@ async def weather_light_routine(bridge):
             logging.debug(msg=f"error changing weather light", exc_info=ex)
 
         await asyncio.sleep(weather_update_time_secs)
+
+
+def get_inside_temp_in_f(bridge):
+    # log all temps
+    if logging.getLogger().isEnabledFor(logging.DEBUG):
+        try:
+            front_temp_obj = bridge.sensors.temperature.get(front_temp_id)
+            front_temp_f = celsius_to_fahrenheit(front_temp_obj.temperature.temperature)
+            logging.debug(f"front temp: {front_temp_f}"
+                          f" - time: {front_temp_obj.temperature.temperature_report.changed}")
+        except Exception as ex:
+            logging.debug(msg=f"error getting front temp", exc_info=ex)
+
+        try:
+            bathroom_temp_obj = bridge.sensors.temperature.get(bathroom_temp_id)
+            bathroom_temp_f = celsius_to_fahrenheit(bathroom_temp_obj.temperature.temperature)
+            logging.debug(f"bathroom temp: {bathroom_temp_f}"
+                          f" - time: {bathroom_temp_obj.temperature.temperature_report.changed}")
+        except Exception as ex:
+            logging.debug(msg=f"error getting bathroom temp", exc_info=ex)
+
+    # return temp from living room
+    living_room_temp_obj = bridge.sensors.temperature.get(living_room_temp_id)
+    living_room_temp_f = celsius_to_fahrenheit(living_room_temp_obj.temperature.temperature)
+    logging.debug(f"living temp: {living_room_temp_f}"
+                  f" - time: {living_room_temp_obj.temperature.temperature_report.changed}")
+
+    return living_room_temp_f
+
+
+def celsius_to_fahrenheit(temp_celsius: float) -> float:
+    return (temp_celsius * 1.8) + 32
 
 
 # change the lights over to an evening scene (only if they are currently on)
