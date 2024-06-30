@@ -4,7 +4,9 @@ import argparse
 import asyncio
 import contextlib
 import logging
-import time
+from datetime import datetime
+from pytz import timezone
+
 import requests
 
 from aiohue import HueBridgeV2
@@ -248,7 +250,10 @@ async def schedules_routine(bridge):
 
     while True:
         try:
-            current_time = time.strftime('%H:%M')
+            my_timezone = "US/Eastern"
+            current_datetime_eastern = datetime.now(timezone(my_timezone))
+            current_time = current_datetime_eastern.strftime('%H:%M')
+            logging.debug(f"current_time in {my_timezone}: {current_time}")
 
             if current_time == evening_scene_switchover_time:
                 await change_zone_scene_at_time_if_lights_on(
