@@ -4,7 +4,7 @@ import argparse
 import asyncio
 import contextlib
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pytz import timezone
 
 import requests
@@ -20,10 +20,17 @@ parser = argparse.ArgumentParser(description="Hue Routines")
 parser.add_argument("--debug", help="enable debug logging", action="store_true")
 args = parser.parse_args()
 
-
 # light rules
 
-evening_scene_switchover_time = "20:30"  # 8:30 pm
+# afternoon scene will be activated this long before evening scene switchover
+afternoon_evening_offset_minutes = 120
+# this is the time the evening scene will be activated if we can't get sunset data
+# 8:00 pm
+evening_scene_switchover_fallback_hour = 20
+evening_scene_switchover_fallback_minute = 00
+my_timezone = "US/Eastern"
+afternoon_scene_name = "diet evening"
+evening_scene_name = "evening"
 
 bathroom_update_time_secs = 60 * 1  # minutes
 
@@ -101,21 +108,16 @@ async def weather_light_routine(bridge):
                 prev_weather_zone_brightness = weather_zone_state.dimming.brightness
                 logging.debug(f"weather_zone_brightness: {prev_weather_zone_brightness}")
 
-                response = requests.get(
-                    "https://api.openweathermap.org/data/2.5/weather"
-                    f"?q={city_name}"
-                    f"&appid={weather_api_key}"
-                    "&units=imperial")
-                response.raise_for_status()
+                weather_api_response = call_weather_api()
 
-                cur_weather = str(response.json().get("weather")[0].get("main")).lower()
+                cur_weather = str(weather_api_response.json().get("weather")[0].get("main")).lower()
                 logging.debug(f"current weather: {cur_weather}")
 
                 # animate lights for inside/outside temp difference
                 try:
                     inside_temp = get_inside_temp_in_f(bridge)
                     # feels like temp
-                    outside_temp = response.json().get("main").get("feels_like")
+                    outside_temp = weather_api_response.json().get("main").get("feels_like")
                     logging.debug(f"outside temp: {outside_temp}")
 
                     upper_range = inside_temp + weather_temp_diff_range
@@ -223,13 +225,25 @@ async def change_zone_scene_at_time_if_lights_on(bridge, time, zone_name, zone_g
         return
 
 
+def call_weather_api():
+    response = requests.get(
+        "https://api.openweathermap.org/data/2.5/weather"
+        f"?q={city_name}"
+        f"&appid={weather_api_key}"
+        "&units=imperial")
+    response.raise_for_status()
+
+    return response
+
+
 # do stuff at certain times
 async def schedules_routine(bridge):
     # setup
     try:
-        living_area_group_id = ""
-        living_area_id = ""
-        living_area_evening_id = ""
+        living_area_group_id = None
+        living_area_id = None
+        living_area_evening_scene_id = None
+        living_area_afternoon_scene_id = None
         for group in bridge.groups:
             if isinstance(group, Zone):
                 if group.metadata.name.lower() == "living area":
@@ -239,35 +253,83 @@ async def schedules_routine(bridge):
 
         for scene in bridge.groups.zone.get_scenes(living_area_id):
             scene_name = scene.metadata.name.lower()
-            if scene_name == "evening":
-                living_area_evening_id = scene.id
+            if scene_name == evening_scene_name.lower():
+                living_area_evening_scene_id = scene.id
                 logging.debug(f"found '{scene_name}' scene for schedules")
-                break
+            elif scene_name == afternoon_scene_name.lower():
+                living_area_afternoon_scene_id = scene.id
+                logging.debug(f"found '{scene_name}' scene for schedules")
 
     except Exception as ex:
         logging.debug(msg=f"error setting up schedules routine", exc_info=ex)
         return
 
-    while True:
-        try:
-            my_timezone = "US/Eastern"
-            current_datetime_eastern = datetime.now(timezone(my_timezone))
-            current_time = current_datetime_eastern.strftime('%H:%M')
-            logging.debug(f"current_time in {my_timezone}: {current_time}")
+    # get sunset time at startup
+    sunset_datetime_with_timezone = get_sunset_time(fallback_time=None)
 
-            if current_time == evening_scene_switchover_time:
+    while True:
+        current_datetime_with_timezone = datetime.now(timezone(my_timezone))
+        current_time = current_datetime_with_timezone.strftime('%H:%M')
+        logging.debug(f"current_time in {my_timezone}: {current_time}")
+
+        # try to update sunset time
+        if current_datetime_with_timezone.strftime('%M') == "00":
+            if sunset_datetime_with_timezone is None \
+                    or sunset_datetime_with_timezone.date() != current_datetime_with_timezone.date():
+                sunset_datetime_with_timezone = get_sunset_time(fallback_time=sunset_datetime_with_timezone)
+
+        try:
+            if sunset_datetime_with_timezone is not None:
+                # we have sunset time
+                evening_switchover_datetime = sunset_datetime_with_timezone
+            else:
+                # fallback time if no sunset
+                evening_switchover_datetime = \
+                    datetime.today().replace(hour=evening_scene_switchover_fallback_hour,
+                                             minute=evening_scene_switchover_fallback_minute)
+            afternoon_switchover_datetime = evening_switchover_datetime - \
+                                            timedelta(minutes=afternoon_evening_offset_minutes)
+
+            afternoon_switchover_time = afternoon_switchover_datetime.strftime('%H:%M')
+            evening_switchover_time = evening_switchover_datetime.strftime('%H:%M')
+            logging.debug(f"afternoon scene switchover time: {afternoon_switchover_time}")
+            logging.debug(f"sunset/evening scene switchover time: {evening_switchover_time}")
+
+            if current_time == afternoon_switchover_time:
                 await change_zone_scene_at_time_if_lights_on(
                     bridge,
-                    time=evening_scene_switchover_time,
+                    time=current_time,
                     zone_name="living area",
                     zone_group_id=living_area_group_id,
-                    scene_name="evening",
-                    scene_id=living_area_evening_id)
+                    scene_name=afternoon_scene_name,
+                    scene_id=living_area_afternoon_scene_id)
+
+            if current_time == evening_switchover_time:
+                await change_zone_scene_at_time_if_lights_on(
+                    bridge,
+                    time=current_time,
+                    zone_name="living area",
+                    zone_group_id=living_area_group_id,
+                    scene_name=evening_scene_name,
+                    scene_id=living_area_evening_scene_id)
 
         except Exception as ex:
             logging.debug(msg=f"error running schedules", exc_info=ex)
 
         await asyncio.sleep(60)
+
+
+def get_sunset_time(fallback_time):
+    try:
+        weather_api_response = call_weather_api()
+        sunset_unix_utc = weather_api_response.json().get("sys").get("sunset")
+        sunset_datetime = datetime.fromtimestamp(sunset_unix_utc, timezone(my_timezone))
+        logging.debug(f"sunset datetime: {sunset_datetime}")
+        return sunset_datetime
+
+    except Exception as ex:
+        logging.debug(msg="error updating sunset time", exc_info=ex)
+        return fallback_time
 
 
 # turn off bathroom lights when not needed
