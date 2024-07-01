@@ -38,7 +38,7 @@ weather_update_time_secs = 60 * 5  # minutes
 weather_transition_time_ms = 1000 * 3  # seconds
 
 # display difference in inside/outside temp
-weather_temp_diff_range = 3  # degrees fahrenheit
+weather_temp_diff_range = 5  # degrees fahrenheit
 weather_temp_brightness_diff = -20  # change in brightness at beginning of animation
 weather_temp_wait_time_secs = 10  # show temp diff color for this long
 # scene names
