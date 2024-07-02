@@ -22,29 +22,29 @@ args = parser.parse_args()
 
 # light rules
 
-# afternoon scene will be activated this long before evening scene switchover
-afternoon_evening_offset_minutes = 120
-# this is the time the evening scene will be activated if we can't get sunset data
-# 8:00 pm
-evening_scene_switchover_fallback_hour = 20
-evening_scene_switchover_fallback_minute = 00
-my_timezone = "US/Eastern"
-afternoon_scene_name = "diet evening"
-evening_scene_name = "evening"
-
-bathroom_update_time_secs = 60 * 1  # minutes
-
-weather_update_time_secs = 60 * 5  # minutes
-weather_transition_time_ms = 1000 * 3  # seconds
-
-# display difference in inside/outside temp
-weather_temp_diff_range = 5  # degrees fahrenheit
-weather_temp_brightness_diff = -20  # change in brightness at beginning of animation
-weather_temp_wait_time_secs = 10  # show temp diff color for this long
-# scene names
-weather_temp_colder_scene = "colder"
-weather_temp_same_scene = "same"
-weather_temp_hotter_scene = "hotter"
+# # amount of time before the evening scene switchover that it will switch to afternoon scene
+# afternoon_evening_offset_minutes = 120
+# # this is the time the evening scene will be activated if we can't get sunset data
+# # 8:00 pm
+# evening_scene_switchover_fallback_hour = 20
+# evening_scene_switchover_fallback_minute = 00
+# my_timezone = "US/Eastern"
+# afternoon_scene_name = "afternoon"
+# evening_scene_name = "evening"
+#
+# bathroom_update_time_secs = 60 * 1  # minutes
+#
+# weather_update_time_secs = 60 * 5  # minutes
+# weather_transition_time_ms = 1000 * 3  # seconds
+#
+# # display difference in inside/outside temp
+# weather_temp_diff_range = 5  # degrees Fahrenheit
+# weather_temp_brightness_diff = -20  # change in brightness at beginning of animation
+# weather_temp_wait_time_secs = 10  # show temp diff color for this long
+# # scene names
+# weather_temp_colder_scene = "colder"
+# weather_temp_same_scene = "same"
+# weather_temp_hotter_scene = "hotter"
 
 
 async def main():
