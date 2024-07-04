@@ -3,4 +3,4 @@ services:
   hue_routines:
     build: ./
     restart: unless-stopped
-    command: python3 ./hue_routines_main.py
+    command: python3 /app/hue_routines_main.py
