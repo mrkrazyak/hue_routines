@@ -3,8 +3,12 @@
 import argparse
 import asyncio
 import contextlib
+
 import logging
 from datetime import datetime, timedelta
+
+from aiohue.v2.models.grouped_light import GroupedLight
+from aiohue.v2.models.motion import Motion
 from pytz import timezone
 
 import requests
@@ -14,6 +18,7 @@ from aiohue.v2.models.contact import ContactState
 from aiohue.v2.models.room import Room
 from aiohue.v2.models.zone import Zone
 
+from custom_holidays import CustomHolidays
 from hue_config import *
 
 parser = argparse.ArgumentParser(description="Hue Routines")
@@ -46,6 +51,14 @@ args = parser.parse_args()
 # weather_temp_same_scene = "same"
 # weather_temp_hotter_scene = "hotter"
 
+holiday_group_id = None
+holiday_id = None
+holiday_scene_map = dict()
+holiday_last_on_datetime = None
+us_ny_holidays = CustomHolidays(subdiv='NY', observed=False)
+
+bridge = HueBridgeV2(bridge_ip, hue_app_key)
+
 
 async def main():
     """
@@ -58,8 +71,15 @@ async def main():
             format="%(asctime)-15s %(levelname)-5s %(name)s -- %(message)s",
         )
 
-    async with HueBridgeV2(bridge_ip, hue_app_key) as bridge:
+    async with HueBridgeV2(bridge_ip, hue_app_key) as b:
+        global bridge
+        bridge = b
         logging.debug(f"Connected to bridge: {bridge.bridge_id}")
+
+        setup_variables(bridge)
+
+        bridge.subscribe(holiday_subscriber)
+        # bridge.subscribe(bathroom_off_subscriber)
 
         # run all routines in background continuously
         async with asyncio.TaskGroup() as tg:
@@ -67,7 +87,64 @@ async def main():
             tg.create_task(schedules_routine(bridge))
             tg.create_task(bathroom_auto_light_routine(bridge))
 
-        # await asyncio.sleep(5)
+
+async def holiday_subscriber(event_type, item):
+    try:
+        if (isinstance(item, GroupedLight)
+                and item.id == holiday_group_id
+                and item.on.on is True):
+
+            current_datetime = datetime.now(timezone(my_timezone))
+            global holiday_last_on_datetime
+
+            if (holiday_last_on_datetime is None
+                    or holiday_last_on_datetime <= current_datetime - timedelta(hours=holiday_scene_interval_hours)):
+
+                update_holiday_scenes()
+
+                current_date = current_datetime.strftime('%Y-%m-%d')
+                holiday = us_ny_holidays.get(current_date)
+
+                if holiday is not None:
+                    logging.debug(f"it's a holiday! {holiday}")
+                    normalized_holiday_name = normalize_holiday_name(holiday)
+                    scene_id = holiday_scene_map.get(normalized_holiday_name)
+                    if scene_id is not None:
+                        prev_brightness = item.dimming.brightness
+                        await bridge.scenes.recall(id=scene_id, brightness=prev_brightness)
+
+            holiday_last_on_datetime = current_datetime
+
+    except Exception as ex:
+        logging.debug(msg=f"error activating holiday lights", exc_info=ex)
+
+
+def setup_variables(bridge):
+    global holiday_group_id
+    global holiday_id
+    for group in bridge.groups:
+        if isinstance(group, Zone):
+            if group.metadata.name.lower() == holiday_zone_name:
+                holiday_group_id = group.grouped_light
+                holiday_id = group.id
+                break
+
+
+def update_holiday_scenes():
+    global holiday_scene_map
+    holiday_scene_map = dict()
+    for scene in bridge.groups.zone.get_scenes(holiday_id):
+        scene_name = normalize_holiday_name(scene.metadata.name)
+        holiday_scene_map[scene_name] = scene.id
+    return holiday_scene_map
+
+
+def discover_scenes_in_zone(zone_id):
+    scene_map = dict()
+    for scene in bridge.groups.zone.get_scenes(zone_id):
+        scene_name = scene.metadata.name.lower()
+        scene_map[scene_name] = scene.id
+    return scene_map
 
 
 # change my light depending on weather
@@ -133,7 +210,8 @@ async def weather_light_routine(bridge):
                         logging.debug(f"outside temp is close to inside temp")
                         temp_scene = weather_temp_same_scene
 
-                    start_brightness = prev_weather_zone_brightness + weather_temp_brightness_diff
+                    start_brightness = get_adjusted_brightness(brightness=prev_weather_zone_brightness,
+                                                               brightness_adj=weather_temp_brightness_diff)
                     temp_scene_id = weather_scene_map.get(temp_scene)
                     if temp_scene_id is None:
                         raise Exception(f"could not find scene named '{temp_scene}'")
@@ -332,6 +410,21 @@ def get_sunset_time(fallback_time):
         return fallback_time
 
 
+async def bathroom_off_subscriber(event_type, item):
+    try:
+        if isinstance(item, Motion):
+            if item.id == bathroom_motion_id and item.motion.motion_report.motion is False:
+                bathroom_door_opened = \
+                    bridge.sensors.contact.get(
+                        bathroom_contact_id).contact_report.state == ContactState.NO_CONTACT
+
+                if bathroom_door_opened:
+                    logging.debug("turning bathroom off because no motion")
+                    await bridge.groups.grouped_light.set_state(bathroom_group_id, False)
+    except Exception as ex:
+        logging.debug(msg=f"error checking bathroom motion", exc_info=ex)
+
+
 # turn off bathroom lights when not needed
 async def bathroom_auto_light_routine(bridge):
     # setup
@@ -373,6 +466,20 @@ async def bathroom_auto_light_routine(bridge):
             logging.debug(msg=f"error checking bathroom lights", exc_info=ex)
 
         await asyncio.sleep(bathroom_update_time_secs)
+
+
+def get_adjusted_brightness(brightness, brightness_adj):
+    result = brightness + brightness_adj
+    if result < 0:
+        return 0
+    if result > 100:
+        return 100
+    return result
+
+
+def normalize_holiday_name(holiday):
+    new_holiday = holiday.lower().replace(" ", "").replace("'", "").replace(".", "").replace("day", "")
+    return "juneteenth" if new_holiday == "juneteenthnationalindependence" else new_holiday
 
 
 with contextlib.suppress(KeyboardInterrupt):
