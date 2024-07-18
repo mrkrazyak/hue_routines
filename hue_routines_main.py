@@ -51,6 +51,9 @@ args = parser.parse_args()
 # weather_temp_same_scene = "same"
 # weather_temp_hotter_scene = "hotter"
 
+sunset_datetime = None
+last_fetched_sunset_time = None
+
 holiday_group_id = None
 holiday_id = None
 holiday_scene_map = dict()
@@ -94,7 +97,7 @@ async def holiday_subscriber(event_type, item):
                 and item.id == holiday_group_id
                 and item.on.on is True):
 
-            current_datetime = datetime.now(timezone(my_timezone))
+            current_datetime = get_current_datetime()
             global holiday_last_on_datetime
 
             if (holiday_last_on_datetime is None
@@ -186,6 +189,7 @@ async def weather_light_routine(bridge):
                 logging.debug(f"weather_zone_brightness: {prev_weather_zone_brightness}")
 
                 weather_api_response = call_weather_api()
+                parse_sunset_time_and_update(weather_api_response)
 
                 cur_weather = str(weather_api_response.json().get("weather")[0].get("main")).lower()
                 logging.debug(f"current weather: {cur_weather}")
@@ -342,35 +346,17 @@ async def schedules_routine(bridge):
         logging.debug(msg=f"error setting up schedules routine", exc_info=ex)
         return
 
-    # get sunset time at startup
-    sunset_datetime_with_timezone = get_sunset_time(fallback_time=None)
-
     while True:
-        current_datetime_with_timezone = datetime.now(timezone(my_timezone))
+        current_datetime_with_timezone = get_current_datetime()
         current_time = current_datetime_with_timezone.strftime('%H:%M')
         logging.debug(f"current_time in {my_timezone}: {current_time}")
 
-        # try to update sunset time
-        if current_datetime_with_timezone.strftime('%M') == "00":
-            if sunset_datetime_with_timezone is None \
-                    or sunset_datetime_with_timezone.date() != current_datetime_with_timezone.date():
-                sunset_datetime_with_timezone = get_sunset_time(fallback_time=sunset_datetime_with_timezone)
-
         try:
-            if sunset_datetime_with_timezone is not None:
-                # we have sunset time
-                evening_switchover_datetime = sunset_datetime_with_timezone + \
-                                              timedelta(minutes=evening_scene_sunset_offset_minutes)
-            else:
-                # fallback time if no sunset
-                evening_switchover_datetime = \
-                    datetime.today().replace(hour=evening_scene_switchover_fallback_hour,
-                                             minute=evening_scene_switchover_fallback_minute)
-            afternoon_switchover_datetime = evening_switchover_datetime - \
-                                            timedelta(minutes=afternoon_evening_offset_minutes)
+            evening_scene_start_time = get_evening_scene_start_time()
+            afternoon_scene_start_time = get_afternoon_scene_start_time(evening_scene_start_time)
 
-            afternoon_switchover_time = afternoon_switchover_datetime.strftime('%H:%M')
-            evening_switchover_time = evening_switchover_datetime.strftime('%H:%M')
+            afternoon_switchover_time = afternoon_scene_start_time.strftime('%H:%M')
+            evening_switchover_time = evening_scene_start_time.strftime('%H:%M')
             logging.debug(f"afternoon scene switchover time: {afternoon_switchover_time}")
             logging.debug(f"sunset/evening scene switchover time: {evening_switchover_time}")
 
@@ -398,17 +384,64 @@ async def schedules_routine(bridge):
         await asyncio.sleep(60)
 
 
-def get_sunset_time(fallback_time):
-    try:
-        weather_api_response = call_weather_api()
-        sunset_unix_utc = weather_api_response.json().get("sys").get("sunset")
-        sunset_datetime = datetime.fromtimestamp(sunset_unix_utc, timezone(my_timezone))
-        logging.debug(f"sunset datetime: {sunset_datetime}")
-        return sunset_datetime
+def get_current_datetime():
+    return datetime.now(timezone(my_timezone))
 
+
+def get_evening_scene_start_time():
+    global sunset_datetime
+    if sunset_datetime is None \
+            or sunset_datetime.date() != get_current_datetime().date():
+        try:
+            return fetch_sunset_time_from_api() + timedelta(minutes=evening_scene_sunset_offset_minutes)
+
+        except Exception as ex:
+            logging.debug(msg="error updating sunset time", exc_info=ex)
+
+    if sunset_datetime is not None:
+        start_time = sunset_datetime + timedelta(minutes=evening_scene_sunset_offset_minutes)
+    else:
+        start_time = datetime.today().replace(hour=evening_scene_switchover_fallback_hour,
+                                              minute=evening_scene_switchover_fallback_minute) + \
+                     timedelta(minutes=evening_scene_sunset_offset_minutes)
+    return start_time
+
+
+def get_afternoon_scene_start_time(evening_scene_start_time):
+    return evening_scene_start_time - timedelta(minutes=afternoon_evening_offset_minutes)
+
+
+def fetch_sunset_time_from_api():
+    api_fetch_interval_mins = 10
+    current_time = get_current_datetime()
+    global last_fetched_sunset_time
+
+    if (last_fetched_sunset_time is None
+            or last_fetched_sunset_time <= current_time - timedelta(minutes=api_fetch_interval_mins)):
+        last_fetched_sunset_time = current_time
+
+        weather_api_response = call_weather_api()
+        fetched_sunset_time = parse_sunset_time_and_update(weather_api_response)
+        if fetched_sunset_time is not None:
+            return fetched_sunset_time
+        else:
+            raise Exception("Error calling weather api/parsing response")
+    else:
+        raise Exception(f"Not calling api again, last called time: {last_fetched_sunset_time}")
+
+
+def parse_sunset_time_and_update(weather_api_response):
+    global sunset_datetime
+    try:
+        if sunset_datetime is None \
+                or sunset_datetime.date() != get_current_datetime().date():
+            sunset_unix_utc = weather_api_response.json().get("sys").get("sunset")
+            sunset_datetime = datetime.fromtimestamp(sunset_unix_utc, timezone(my_timezone))
+            logging.debug(f"sunset datetime: {sunset_datetime}")
+        return sunset_datetime
     except Exception as ex:
-        logging.debug(msg="error updating sunset time", exc_info=ex)
-        return fallback_time
+        logging.debug(msg="error parsing sunset from weather api response", exc_info=ex)
+        return None
 
 
 async def bathroom_off_subscriber(event_type, item):
