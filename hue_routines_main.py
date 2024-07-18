@@ -359,7 +359,8 @@ async def schedules_routine(bridge):
         try:
             if sunset_datetime_with_timezone is not None:
                 # we have sunset time
-                evening_switchover_datetime = sunset_datetime_with_timezone
+                evening_switchover_datetime = sunset_datetime_with_timezone + \
+                                              timedelta(minutes=evening_scene_sunset_offset_minutes)
             else:
                 # fallback time if no sunset
                 evening_switchover_datetime = \
