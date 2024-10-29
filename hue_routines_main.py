@@ -214,6 +214,7 @@ async def weather_light_routine(bridge):
                         logging.debug(f"outside temp is close to inside temp")
                         temp_scene = weather_temp_same_scene
 
+                    prev_weather_zone_brightness = bridge.groups.grouped_light.get(weather_group_id).dimming.brightness
                     start_brightness = get_adjusted_brightness(brightness=prev_weather_zone_brightness,
                                                                brightness_adj=weather_temp_brightness_diff)
                     temp_scene_id = weather_scene_map.get(temp_scene)
@@ -226,6 +227,7 @@ async def weather_light_routine(bridge):
                                                brightness=start_brightness)
                     await asyncio.sleep(1)
                     # bring back to same brightness as before
+                    prev_weather_zone_brightness = bridge.groups.grouped_light.get(weather_group_id).dimming.brightness
                     await bridge.scenes.recall(temp_scene_id,
                                                duration=weather_transition_time_ms,
                                                brightness=prev_weather_zone_brightness)
@@ -243,6 +245,7 @@ async def weather_light_routine(bridge):
 
                 if scene_id is not None:
                     # turn on correct weather scene and don't change brightness
+                    prev_weather_zone_brightness = bridge.groups.grouped_light.get(weather_group_id).dimming.brightness
                     await bridge.scenes.recall(scene_id,
                                                duration=weather_transition_time_ms,
                                                brightness=prev_weather_zone_brightness)
@@ -294,7 +297,7 @@ def celsius_to_fahrenheit(temp_celsius: float) -> float:
 async def change_zone_scene_at_time_if_lights_on(bridge, time, zone_name, zone_group_id, scene_name, scene_id):
     try:
         logging.debug(
-            f"the time is {time} so we're changing the scene to {scene_name} in zone {zone_name} if lights are on")
+            f"the time is {time} so we're changing the scene to '{scene_name}' in zone '{zone_name}' if lights are on")
         zone_state = bridge.groups.grouped_light.get(zone_group_id)
         zone_is_on = zone_state.on.on
         logging.debug(f"{zone_name} - {scene_name} - zone_is_on: {zone_is_on}")
@@ -326,6 +329,7 @@ async def schedules_routine(bridge):
         living_area_id = None
         living_area_evening_scene_id = None
         living_area_afternoon_scene_id = None
+        living_area_late_night_scene_id = None
         for group in bridge.groups:
             if isinstance(group, Zone):
                 if group.metadata.name.lower() == "living area":
@@ -340,6 +344,9 @@ async def schedules_routine(bridge):
                 logging.debug(f"found '{scene_name}' scene for schedules")
             elif scene_name == afternoon_scene_name.lower():
                 living_area_afternoon_scene_id = scene.id
+                logging.debug(f"found '{scene_name}' scene for schedules")
+            elif scene_name == late_night_scene_name.lower():
+                living_area_late_night_scene_id = scene.id
                 logging.debug(f"found '{scene_name}' scene for schedules")
 
     except Exception as ex:
@@ -377,6 +384,15 @@ async def schedules_routine(bridge):
                     zone_group_id=living_area_group_id,
                     scene_name=evening_scene_name,
                     scene_id=living_area_evening_scene_id)
+
+            if current_time == late_night_switchover_time:
+                await change_zone_scene_at_time_if_lights_on(
+                    bridge,
+                    time=current_time,
+                    zone_name="living area",
+                    zone_group_id=living_area_group_id,
+                    scene_name=late_night_scene_name,
+                    scene_id=living_area_late_night_scene_id)
 
         except Exception as ex:
             logging.debug(msg=f"error running schedules", exc_info=ex)
