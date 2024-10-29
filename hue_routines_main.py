@@ -214,7 +214,6 @@ async def weather_light_routine(bridge):
                         logging.debug(f"outside temp is close to inside temp")
                         temp_scene = weather_temp_same_scene
 
-                    prev_weather_zone_brightness = bridge.groups.grouped_light.get(weather_group_id).dimming.brightness
                     start_brightness = get_adjusted_brightness(brightness=prev_weather_zone_brightness,
                                                                brightness_adj=weather_temp_brightness_diff)
                     temp_scene_id = weather_scene_map.get(temp_scene)
@@ -227,7 +226,6 @@ async def weather_light_routine(bridge):
                                                brightness=start_brightness)
                     await asyncio.sleep(1)
                     # bring back to same brightness as before
-                    prev_weather_zone_brightness = bridge.groups.grouped_light.get(weather_group_id).dimming.brightness
                     await bridge.scenes.recall(temp_scene_id,
                                                duration=weather_transition_time_ms,
                                                brightness=prev_weather_zone_brightness)
@@ -245,7 +243,6 @@ async def weather_light_routine(bridge):
 
                 if scene_id is not None:
                     # turn on correct weather scene and don't change brightness
-                    prev_weather_zone_brightness = bridge.groups.grouped_light.get(weather_group_id).dimming.brightness
                     await bridge.scenes.recall(scene_id,
                                                duration=weather_transition_time_ms,
                                                brightness=prev_weather_zone_brightness)
