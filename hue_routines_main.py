@@ -203,7 +203,11 @@ async def weather_light_routine(bridge):
 
                     upper_range = inside_temp + weather_temp_diff_range
                     lower_range = inside_temp - weather_temp_diff_range
-                    if outside_temp < lower_range:
+                    freezing_temp = 32
+                    if outside_temp <= freezing_temp:
+                        logging.debug(f"outside temp is lower than freezing_temp: {freezing_temp}")
+                        temp_scene = weather_temp_freezing_scene
+                    elif outside_temp < lower_range:
                         logging.debug(f"outside temp is lower than {lower_range} degrees")
                         temp_scene = weather_temp_colder_scene
                     elif outside_temp > upper_range:
