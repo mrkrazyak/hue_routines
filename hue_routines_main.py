@@ -51,6 +51,11 @@ args = parser.parse_args()
 # weather_temp_same_scene = "same"
 # weather_temp_hotter_scene = "hotter"
 
+time_based_scene_name = "Time Based Scene"
+living_area_auto_time_scene_id = None
+living_area_time_scenes_map = None
+living_area_auto_scene_id = None
+living_area_id = None
 sunset_datetime = None
 last_fetched_sunset_time = None
 
@@ -125,12 +130,68 @@ async def holiday_subscriber(event_type, item):
 def setup_variables(bridge):
     global holiday_group_id
     global holiday_id
+    global living_area_id
+    global living_area_time_scenes_map
+    global living_area_auto_time_scene_id
+
     for group in bridge.groups:
         if isinstance(group, Zone):
             if group.metadata.name.lower() == holiday_zone_name:
                 holiday_group_id = group.grouped_light
                 holiday_id = group.id
                 break
+
+    for group in bridge.groups:
+        if isinstance(group, Zone):
+            if group.metadata.name.lower() == "living area":
+                living_area_time_scenes_map = {}
+                # living_area_group_id = group.grouped_light
+                living_area_id = group.id
+                for scene in bridge.groups.zone.get_scenes(living_area_id):
+                    scene_name = scene.metadata.name.lower()
+                    if scene_name == time_based_scene_name.lower():
+                        living_area_auto_time_scene_id = scene.id
+                    add_scene_to_time_map(living_area_time_scenes_map, scene_name)
+                break
+
+
+def add_scene_to_time_map(time_scenes_map, scene_name):
+    try:
+        # Example scene name with time: "Evening (8pm)"
+        # time in parentheses will be used as scene start time
+        name_parts = scene_name.lower().split("(")
+        if len(name_parts) > 1:
+            scene_start_time = name_parts[1].split(")")[0].replace(" ", "")
+            normalized_scene_start_time = normalize_am_pm_time(scene_start_time)
+            scene_start_datetime = datetime.strptime(normalized_scene_start_time, "%I:%M %p")
+            logging.debug(f"scene_start_datetime: {scene_start_datetime}")
+    except Exception as ex:
+        logging.debug(msg=f"error parsing scene name:{scene_name} when adding to time scenes map", exc_info=ex)
+        return
+
+
+def normalize_am_pm_time(time_string):
+    time_string = time_string.lower()
+    time_parts = time_string.split("a")
+    time_is_am = False
+    if len(time_parts) > 1:
+        time_is_am = True
+        time_string = time_parts[0]
+    else:
+        time_string = time_string.split("p")[0]
+
+    split_on_colon = time_string.split(":")
+    if len(split_on_colon) == 1:
+        time_string = time_string + ":00"
+    if len(time_string) == 4:
+        time_string = "0" + time_string
+    time_string = time_string + " "
+    if time_is_am:
+        time_string = time_string + "AM"
+    else:
+        time_string = time_string + "PM"
+
+    return time_string
 
 
 def update_holiday_scenes():
