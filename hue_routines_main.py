@@ -52,6 +52,8 @@ args = parser.parse_args()
 # weather_temp_hotter_scene = "hotter"
 
 time_based_scene_name = "Time Based Scene"
+scene_start_time_sunset = "Sunset"
+scene_start_time_before_sunset = "Before Sunset"
 living_area_auto_time_scene_id = None
 living_area_time_scenes_map = None
 living_area_auto_scene_id = None
@@ -84,13 +86,14 @@ async def main():
         bridge = b
         logging.debug(f"Connected to bridge: {bridge.bridge_id}")
 
-        setup_variables(bridge)
+        update_variables(bridge)
 
         bridge.subscribe(holiday_subscriber)
         # bridge.subscribe(bathroom_off_subscriber)
 
         # run all routines in background continuously
         async with asyncio.TaskGroup() as tg:
+            tg.create_task(update_variables_routine(bridge))
             tg.create_task(weather_light_routine(bridge))
             tg.create_task(schedules_routine(bridge))
             tg.create_task(bathroom_auto_light_routine(bridge))
@@ -127,44 +130,63 @@ async def holiday_subscriber(event_type, item):
         logging.debug(msg=f"error activating holiday lights", exc_info=ex)
 
 
-def setup_variables(bridge):
+async def update_variables_routine(bridge):
+    while True:
+        await asyncio.sleep(300)
+        update_variables(bridge)
+
+
+def update_variables(bridge):
     global holiday_group_id
     global holiday_id
     global living_area_id
     global living_area_time_scenes_map
     global living_area_auto_time_scene_id
 
-    for group in bridge.groups:
-        if isinstance(group, Zone):
-            if group.metadata.name.lower() == holiday_zone_name:
-                holiday_group_id = group.grouped_light
-                holiday_id = group.id
-                break
+    try:
+        for group in bridge.groups:
+            if isinstance(group, Zone):
+                if group.metadata.name.lower() == holiday_zone_name:
+                    holiday_group_id = group.grouped_light
+                    holiday_id = group.id
+                    break
 
-    for group in bridge.groups:
-        if isinstance(group, Zone):
-            if group.metadata.name.lower() == "living area":
-                living_area_time_scenes_map = {}
-                # living_area_group_id = group.grouped_light
-                living_area_id = group.id
-                for scene in bridge.groups.zone.get_scenes(living_area_id):
-                    scene_name = scene.metadata.name.lower()
-                    if scene_name == time_based_scene_name.lower():
-                        living_area_auto_time_scene_id = scene.id
-                    add_scene_to_time_map(living_area_time_scenes_map, scene_name)
-                break
+        for group in bridge.groups:
+            if isinstance(group, Zone):
+                if group.metadata.name.lower() == "living area":
+                    living_area_time_scenes_map = {}
+                    # living_area_group_id = group.grouped_light
+                    living_area_id = group.id
+                    for scene in bridge.groups.zone.get_scenes(living_area_id):
+                        scene_name = scene.metadata.name.lower()
+                        if scene_name == time_based_scene_name.lower():
+                            living_area_auto_time_scene_id = scene.id
+                        add_scene_to_time_map(living_area_time_scenes_map, scene_name, scene.id)
+                    break
+
+    except Exception as ex:
+        logging.debug(msg=f"error updating global variables", exc_info=ex)
 
 
-def add_scene_to_time_map(time_scenes_map, scene_name):
+def add_scene_to_time_map(time_scenes_map, scene_name, scene_id):
     try:
         # Example scene name with time: "Evening (8pm)"
         # time in parentheses will be used as scene start time
         name_parts = scene_name.lower().split("(")
         if len(name_parts) > 1:
             scene_start_time = name_parts[1].split(")")[0].replace(" ", "")
-            normalized_scene_start_time = normalize_am_pm_time(scene_start_time)
-            scene_start_datetime = datetime.strptime(normalized_scene_start_time, "%I:%M %p")
-            logging.debug(f"scene_start_datetime: {scene_start_datetime}")
+            if scene_start_time == scene_start_time_sunset.lower().replace(" ", ""):
+                scene_start_datetime = get_sunset_scene_start_time()
+            elif scene_start_time == scene_start_time_before_sunset.lower().replace(" ", ""):
+                scene_start_datetime = get_before_sunset_scene_start_time(get_sunset_scene_start_time())
+            else:
+                normalized_scene_start_time = normalize_am_pm_time(scene_start_time)
+                scene_start_datetime = datetime.strptime(normalized_scene_start_time, "%I:%M %p")
+            logging.debug(f"scene_name: {scene_name}, scene_start_datetime: {scene_start_datetime}")
+
+            # map format: { scene start time -> scene id }
+            time_string = scene_start_datetime.strftime('%H:%M')
+            time_scenes_map[time_string] = scene_id
     except Exception as ex:
         logging.debug(msg=f"error parsing scene name:{scene_name} when adding to time scenes map", exc_info=ex)
         return
@@ -355,13 +377,13 @@ def celsius_to_fahrenheit(temp_celsius: float) -> float:
 # so your lights won't turn on when you're not home :)
 # the hue app doesn't let you make a routine to switch to a scene only if those lights are on :(
 # and custom apps people have built that do it cost money :(
-async def change_zone_scene_at_time_if_lights_on(bridge, time, zone_name, zone_group_id, scene_name, scene_id):
+async def change_zone_scene_at_time_if_lights_on(bridge, time, zone_name, zone_group_id, scene_id):
     try:
         logging.debug(
-            f"the time is {time} so we're changing the scene to '{scene_name}' in zone '{zone_name}' if lights are on")
+            f"the time is {time} so we're changing the scene in zone '{zone_name}' if lights are on")
         zone_state = bridge.groups.grouped_light.get(zone_group_id)
         zone_is_on = zone_state.on.on
-        logging.debug(f"{zone_name} - {scene_name} - zone_is_on: {zone_is_on}")
+        logging.debug(f"{zone_name} - zone_is_on: {zone_is_on}")
 
         if zone_is_on:
             await bridge.scenes.recall(scene_id)
@@ -385,30 +407,14 @@ def call_weather_api():
 # do stuff at certain times
 async def schedules_routine(bridge):
     # setup
+    global living_area_time_scenes_map
     try:
         living_area_group_id = None
-        living_area_id = None
-        living_area_evening_scene_id = None
-        living_area_afternoon_scene_id = None
-        living_area_late_night_scene_id = None
         for group in bridge.groups:
             if isinstance(group, Zone):
                 if group.metadata.name.lower() == "living area":
                     living_area_group_id = group.grouped_light
-                    living_area_id = group.id
                     break
-
-        for scene in bridge.groups.zone.get_scenes(living_area_id):
-            scene_name = scene.metadata.name.lower()
-            if scene_name == evening_scene_name.lower():
-                living_area_evening_scene_id = scene.id
-                logging.debug(f"found '{scene_name}' scene for schedules")
-            elif scene_name == afternoon_scene_name.lower():
-                living_area_afternoon_scene_id = scene.id
-                logging.debug(f"found '{scene_name}' scene for schedules")
-            elif scene_name == late_night_scene_name.lower():
-                living_area_late_night_scene_id = scene.id
-                logging.debug(f"found '{scene_name}' scene for schedules")
 
     except Exception as ex:
         logging.debug(msg=f"error setting up schedules routine", exc_info=ex)
@@ -420,40 +426,22 @@ async def schedules_routine(bridge):
         logging.debug(f"current_time in {my_timezone}: {current_time}")
 
         try:
-            evening_scene_start_time = get_evening_scene_start_time()
-            afternoon_scene_start_time = get_afternoon_scene_start_time(evening_scene_start_time)
+            logging.debug(f"current_datetime_with_timezone: {current_datetime_with_timezone}")
+            logging.debug(f"current scenes map: {living_area_time_scenes_map}")
 
-            afternoon_switchover_time = afternoon_scene_start_time.strftime('%H:%M')
-            evening_switchover_time = evening_scene_start_time.strftime('%H:%M')
-            logging.debug(f"afternoon scene switchover time: {afternoon_switchover_time}")
-            logging.debug(f"sunset/evening scene switchover time: {evening_switchover_time}")
+            if living_area_time_scenes_map is not None:
 
-            if current_time == afternoon_switchover_time:
-                await change_zone_scene_at_time_if_lights_on(
-                    bridge,
-                    time=current_time,
-                    zone_name="living area",
-                    zone_group_id=living_area_group_id,
-                    scene_name=afternoon_scene_name,
-                    scene_id=living_area_afternoon_scene_id)
+                scene_id_for_current_time = living_area_time_scenes_map.get(current_time)
+                if scene_id_for_current_time is not None:
+                    await change_zone_scene_at_time_if_lights_on(
+                        bridge,
+                        time=current_time,
+                        zone_name="living area",
+                        zone_group_id=living_area_group_id,
+                        scene_id=scene_id_for_current_time)
 
-            if current_time == evening_switchover_time:
-                await change_zone_scene_at_time_if_lights_on(
-                    bridge,
-                    time=current_time,
-                    zone_name="living area",
-                    zone_group_id=living_area_group_id,
-                    scene_name=evening_scene_name,
-                    scene_id=living_area_evening_scene_id)
-
-            if current_time == late_night_switchover_time:
-                await change_zone_scene_at_time_if_lights_on(
-                    bridge,
-                    time=current_time,
-                    zone_name="living area",
-                    zone_group_id=living_area_group_id,
-                    scene_name=late_night_scene_name,
-                    scene_id=living_area_late_night_scene_id)
+            else:
+                logging.debug("Error: living_area_time_scenes_map is None!")
 
         except Exception as ex:
             logging.debug(msg=f"error running schedules", exc_info=ex)
@@ -465,7 +453,7 @@ def get_current_datetime():
     return datetime.now(timezone(my_timezone))
 
 
-def get_evening_scene_start_time():
+def get_sunset_scene_start_time():
     global sunset_datetime
     if sunset_datetime is None \
             or sunset_datetime.date() != get_current_datetime().date():
@@ -484,8 +472,8 @@ def get_evening_scene_start_time():
     return start_time
 
 
-def get_afternoon_scene_start_time(evening_scene_start_time):
-    return evening_scene_start_time - timedelta(minutes=afternoon_evening_offset_minutes)
+def get_before_sunset_scene_start_time(sunset_scene_start_time):
+    return sunset_scene_start_time - timedelta(minutes=afternoon_evening_offset_minutes)
 
 
 def fetch_sunset_time_from_api():
