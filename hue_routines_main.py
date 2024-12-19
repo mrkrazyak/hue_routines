@@ -25,32 +25,6 @@ parser = argparse.ArgumentParser(description="Hue Routines")
 parser.add_argument("--debug", help="enable debug logging", action="store_true")
 args = parser.parse_args()
 
-# light rules
-
-# # amount of time before the evening scene switchover that it will switch to afternoon scene
-# afternoon_evening_offset_minutes = 120
-# # this is the time the evening scene will be activated if we can't get sunset data
-# # 8:00 pm
-# evening_scene_switchover_fallback_hour = 20
-# evening_scene_switchover_fallback_minute = 00
-# my_timezone = "US/Eastern"
-# afternoon_scene_name = "afternoon"
-# evening_scene_name = "evening"
-#
-# bathroom_update_time_secs = 60 * 1  # minutes
-#
-# weather_update_time_secs = 60 * 5  # minutes
-# weather_transition_time_ms = 1000 * 3  # seconds
-#
-# # display difference in inside/outside temp
-# weather_temp_diff_range = 5  # degrees Fahrenheit
-# weather_temp_brightness_diff = -20  # change in brightness at beginning of animation
-# weather_temp_wait_time_secs = 10  # show temp diff color for this long
-# # scene names
-# weather_temp_colder_scene = "colder"
-# weather_temp_same_scene = "same"
-# weather_temp_hotter_scene = "hotter"
-
 time_based_scene_name = "Time Based Scene"
 scene_start_time_sunset = "Sunset"
 scene_start_time_before_sunset = "Before Sunset"
@@ -579,7 +553,7 @@ def get_adjusted_brightness(brightness, brightness_adj):
 
 def normalize_holiday_name(holiday):
     new_holiday = holiday.lower().replace(" ", "").replace("'", "").replace(".", "").replace("day", "")
-    return "juneteenth" if new_holiday == "juneteenthnationalindependence" else new_holiday
+    return "juneteenth" if new_holiday.startswith("juneteenth") else new_holiday
 
 
 with contextlib.suppress(KeyboardInterrupt):
