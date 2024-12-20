@@ -88,10 +88,11 @@ async def auto_time_scenes_subscriber(event_type, item):
 
         datetime_after = living_area_scene_datetimes_sorted[len(living_area_scene_datetimes_sorted) - 1]
         logging.debug(f"default datetime_after: {datetime_after}")
+        logging.debug(f"current_datetime to compare to sorted scene times: {current_datetime}")
         for scene_datetime in living_area_scene_datetimes_sorted:
             if current_datetime >= scene_datetime:
-                logging.debug(f"found new datetime_after: {datetime_after}")
                 datetime_after = scene_datetime
+                logging.debug(f"found new datetime_after: {datetime_after}")
                 break
 
         datetime_after_string = datetime_after.strftime(hour_min_format)
