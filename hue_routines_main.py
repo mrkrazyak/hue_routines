@@ -174,12 +174,13 @@ def update_variables(bridge):
             # setup sorted scene datetimes to be used for auto time-based scenes
             current_datetime = get_current_datetime()
             living_area_scene_datetimes_sorted = []
+            tz = timezone(my_timezone)
             for scene_time in living_area_time_scenes_map:
                 scene_datetime = (datetime.strptime(scene_time, hour_min_format)
                                   .replace(year=current_datetime.year,
                                            month=current_datetime.month,
-                                           day=current_datetime.day,
-                                           tzinfo=timezone(my_timezone)))
+                                           day=current_datetime.day))
+                scene_datetime = tz.localize(scene_datetime)
                 living_area_scene_datetimes_sorted.append(scene_datetime)
             living_area_scene_datetimes_sorted.sort(reverse=True)
             logging.debug(f"sorted datetimes: {living_area_scene_datetimes_sorted}")
