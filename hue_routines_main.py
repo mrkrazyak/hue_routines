@@ -31,6 +31,7 @@ scene_start_time_sunset = "Sunset"
 scene_start_time_before_sunset = "Before Sunset"
 living_area_auto_time_scene_id = None
 living_area_time_scenes_map = None
+living_area_scene_datetimes_sorted = None
 living_area_auto_scene_id = None
 living_area_id = None
 sunset_datetime = None
@@ -78,28 +79,18 @@ async def main():
 
 async def auto_time_scenes_subscriber(event_type, item):
     global living_area_time_scenes_map
+    global living_area_scene_datetimes_sorted
     current_datetime = get_current_datetime()
-    logging.debug(f"current datetime: {current_datetime}")
 
     try:
-        if living_area_time_scenes_map is None:
+        if living_area_time_scenes_map is None or living_area_scene_datetimes_sorted is None:
             return
 
-        scene_datetimes = []
-        for scene_time in living_area_time_scenes_map:
-            scene_datetime = (datetime.strptime(scene_time, hour_min_format)
-                              .replace(year=current_datetime.year,
-                                       month=current_datetime.month,
-                                       day=current_datetime.day)
-                              .astimezone(timezone(my_timezone)))
-            scene_datetimes.append(scene_datetime)
-        scene_datetimes.sort(reverse=True)
-        logging.debug(f"sorted datetimes: {scene_datetimes}")
-
-        datetime_after = scene_datetimes[len(scene_datetimes) - 1]
+        datetime_after = living_area_scene_datetimes_sorted[len(living_area_scene_datetimes_sorted) - 1]
         logging.debug(f"default datetime_after: {datetime_after}")
-        for scene_datetime in scene_datetimes:
+        for scene_datetime in living_area_scene_datetimes_sorted:
             if current_datetime >= scene_datetime:
+                logging.debug(f"found new datetime_after: {datetime_after}")
                 datetime_after = scene_datetime
                 break
 
@@ -145,7 +136,7 @@ async def holiday_subscriber(event_type, item):
 
 async def update_variables_routine(bridge):
     while True:
-        await asyncio.sleep(300)
+        await asyncio.sleep(60 * 15)
         update_variables(bridge)
 
 
@@ -154,6 +145,7 @@ def update_variables(bridge):
     global holiday_id
     global living_area_id
     global living_area_time_scenes_map
+    global living_area_scene_datetimes_sorted
     global living_area_auto_time_scene_id
 
     try:
@@ -167,8 +159,8 @@ def update_variables(bridge):
         for group in bridge.groups:
             if isinstance(group, Zone):
                 if group.metadata.name.lower() == "living area":
+                    # setup auto time-based scenes for living area
                     living_area_time_scenes_map = {}
-                    # living_area_group_id = group.grouped_light
                     living_area_id = group.id
                     for scene in bridge.groups.zone.get_scenes(living_area_id):
                         scene_name = scene.metadata.name.lower()
@@ -176,6 +168,20 @@ def update_variables(bridge):
                             living_area_auto_time_scene_id = scene.id
                         add_scene_to_time_map(living_area_time_scenes_map, scene_name, scene.id)
                     break
+
+        if living_area_time_scenes_map is not None and len(living_area_time_scenes_map) != 0:
+            # setup sorted scene datetimes to be used for auto time-based scenes
+            current_datetime = get_current_datetime()
+            living_area_scene_datetimes_sorted = []
+            for scene_time in living_area_time_scenes_map:
+                scene_datetime = (datetime.strptime(scene_time, hour_min_format)
+                                  .replace(year=current_datetime.year,
+                                           month=current_datetime.month,
+                                           day=current_datetime.day,
+                                           tzinfo=timezone(my_timezone)))
+                living_area_scene_datetimes_sorted.append(scene_datetime)
+            living_area_scene_datetimes_sorted.sort(reverse=True)
+            logging.debug(f"sorted datetimes: {living_area_scene_datetimes_sorted}")
 
     except Exception as ex:
         logging.debug(msg=f"error updating global variables", exc_info=ex)
