@@ -25,6 +25,7 @@ parser = argparse.ArgumentParser(description="Hue Routines")
 parser.add_argument("--debug", help="enable debug logging", action="store_true")
 args = parser.parse_args()
 
+hour_min_format = "%H:%M"
 time_based_scene_name = "Time Based Scene"
 scene_start_time_sunset = "Sunset"
 scene_start_time_before_sunset = "Before Sunset"
@@ -64,6 +65,8 @@ async def main():
 
         bridge.subscribe(holiday_subscriber)
         # bridge.subscribe(bathroom_off_subscriber)
+        if living_area_auto_time_scene_id is not None:
+            bridge.scenes.subscribe(auto_time_scenes_subscriber, id_filter=living_area_auto_time_scene_id)
 
         # run all routines in background continuously
         async with asyncio.TaskGroup() as tg:
@@ -71,6 +74,42 @@ async def main():
             tg.create_task(weather_light_routine(bridge))
             tg.create_task(schedules_routine(bridge))
             tg.create_task(bathroom_auto_light_routine(bridge))
+
+
+async def auto_time_scenes_subscriber(event_type, item):
+    global living_area_time_scenes_map
+    current_datetime = get_current_datetime()
+    logging.debug(f"current datetime: {current_datetime}")
+
+    try:
+        if living_area_time_scenes_map is None:
+            return
+
+        scene_datetimes = []
+        for scene_time in living_area_time_scenes_map:
+            scene_datetime = (datetime.strptime(scene_time, hour_min_format)
+                              .replace(year=current_datetime.year,
+                                       month=current_datetime.month,
+                                       day=current_datetime.day)
+                              .astimezone(timezone(my_timezone)))
+            scene_datetimes.append(scene_datetime)
+        scene_datetimes.sort(reverse=True)
+        logging.debug(f"sorted datetimes: {scene_datetimes}")
+
+        datetime_after = scene_datetimes[len(scene_datetimes) - 1]
+        logging.debug(f"default datetime_after: {datetime_after}")
+        for scene_datetime in scene_datetimes:
+            if current_datetime >= scene_datetime:
+                datetime_after = scene_datetime
+                break
+
+        datetime_after_string = datetime_after.strftime(hour_min_format)
+        logging.debug(f"datetime_after_string: {datetime_after_string}")
+        current_scene_id = living_area_time_scenes_map.get(datetime_after_string)
+        await bridge.scenes.recall(current_scene_id)
+
+    except Exception as ex:
+        logging.debug(msg=f"error activating time based scene", exc_info=ex)
 
 
 async def holiday_subscriber(event_type, item):
@@ -133,7 +172,7 @@ def update_variables(bridge):
                     living_area_id = group.id
                     for scene in bridge.groups.zone.get_scenes(living_area_id):
                         scene_name = scene.metadata.name.lower()
-                        if scene_name == time_based_scene_name.lower():
+                        if scene_name.replace(" ", "") == time_based_scene_name.lower().replace(" ", ""):
                             living_area_auto_time_scene_id = scene.id
                         add_scene_to_time_map(living_area_time_scenes_map, scene_name, scene.id)
                     break
@@ -159,7 +198,7 @@ def add_scene_to_time_map(time_scenes_map, scene_name, scene_id):
             logging.debug(f"scene_name: {scene_name}, scene_start_datetime: {scene_start_datetime}")
 
             # map format: { scene start time -> scene id }
-            time_string = scene_start_datetime.strftime('%H:%M')
+            time_string = scene_start_datetime.strftime(hour_min_format)
             time_scenes_map[time_string] = scene_id
     except Exception as ex:
         logging.debug(msg=f"error parsing scene name:{scene_name} when adding to time scenes map", exc_info=ex)
