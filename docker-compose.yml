@@ -7,4 +7,4 @@ services:
       options:
         max-size: "10m"
         max-file: "2"
-    command: python3 /app/hue_routines_main.py
+    command: python3 /app/hue_routines_main.py --debug

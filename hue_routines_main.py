@@ -59,13 +59,19 @@ async def main():
 
     async with HueBridgeV2(bridge_ip, hue_app_key) as b:
         global bridge
+
+        # check if certain features are enabled in hue_config.py
+        if "utility_off_rooms" in globals():
+            global utility_off_rooms
+        else:
+            utility_off_rooms = None
+
         bridge = b
         logging.debug(f"Connected to bridge: {bridge.bridge_id}")
 
         update_variables(bridge)
 
         bridge.subscribe(holiday_subscriber)
-        # bridge.subscribe(bathroom_off_subscriber)
         if living_area_auto_time_scene_id is not None:
             bridge.scenes.subscribe(auto_time_scenes_subscriber, id_filter=living_area_auto_time_scene_id)
 
@@ -74,7 +80,9 @@ async def main():
             tg.create_task(update_variables_routine(bridge))
             tg.create_task(weather_light_routine(bridge))
             tg.create_task(schedules_routine(bridge))
-            tg.create_task(bathroom_auto_light_routine(bridge))
+            if utility_off_rooms:
+                for utility_room in utility_off_rooms:
+                    tg.create_task(utility_off_routine(bridge, utility_room))
 
 
 async def auto_time_scenes_subscriber(event_type, item):
@@ -152,20 +160,20 @@ def update_variables(bridge):
     try:
         for group in bridge.groups:
             if isinstance(group, Zone):
-                if group.metadata.name.lower() == holiday_zone_name:
+                if normalize_string(group.metadata.name) == normalize_string(holiday_zone_name):
                     holiday_group_id = group.grouped_light
                     holiday_id = group.id
                     break
 
         for group in bridge.groups:
             if isinstance(group, Zone):
-                if group.metadata.name.lower() == "living area":
+                if normalize_string(group.metadata.name) == normalize_string("living area"):
                     # setup auto time-based scenes for living area
                     living_area_time_scenes_map = {}
                     living_area_id = group.id
                     for scene in bridge.groups.zone.get_scenes(living_area_id):
-                        scene_name = scene.metadata.name.lower()
-                        if scene_name.replace(" ", "") == time_based_scene_name.lower().replace(" ", ""):
+                        scene_name = scene.metadata.name
+                        if normalize_string(scene_name) == normalize_string(time_based_scene_name):
                             living_area_auto_time_scene_id = scene.id
                         add_scene_to_time_map(living_area_time_scenes_map, scene_name, scene.id)
                     break
@@ -193,12 +201,12 @@ def add_scene_to_time_map(time_scenes_map, scene_name, scene_id):
     try:
         # Example scene name with time: "Evening (8pm)"
         # time in parentheses will be used as scene start time
-        name_parts = scene_name.lower().split("(")
+        name_parts = scene_name.split("(")
         if len(name_parts) > 1:
-            scene_start_time = name_parts[1].split(")")[0].replace(" ", "")
-            if scene_start_time == scene_start_time_sunset.lower().replace(" ", ""):
+            scene_start_time = normalize_string(name_parts[1].split(")")[0])
+            if scene_start_time == normalize_string(scene_start_time_sunset):
                 scene_start_datetime = get_sunset_scene_start_time()
-            elif scene_start_time == scene_start_time_before_sunset.lower().replace(" ", ""):
+            elif scene_start_time == normalize_string(scene_start_time_before_sunset):
                 scene_start_datetime = get_before_sunset_scene_start_time(get_sunset_scene_start_time())
             else:
                 normalized_scene_start_time = normalize_am_pm_time(scene_start_time)
@@ -214,7 +222,7 @@ def add_scene_to_time_map(time_scenes_map, scene_name, scene_id):
 
 
 def normalize_am_pm_time(time_string):
-    time_string = time_string.lower()
+    time_string = normalize_string(time_string)
     time_parts = time_string.split("a")
     time_is_am = False
     if len(time_parts) > 1:
@@ -249,7 +257,7 @@ def update_holiday_scenes():
 def discover_scenes_in_zone(zone_id):
     scene_map = dict()
     for scene in bridge.groups.zone.get_scenes(zone_id):
-        scene_name = scene.metadata.name.lower()
+        scene_name = normalize_string(scene.metadata.name)
         scene_map[scene_name] = scene.id
     return scene_map
 
@@ -262,14 +270,14 @@ async def weather_light_routine(bridge):
         weather_id = ""
         for group in bridge.groups:
             if isinstance(group, Zone):
-                if group.metadata.name.lower() == "weather":
+                if normalize_string(group.metadata.name) == "weather":
                     weather_group_id = group.grouped_light
                     weather_id = group.id
                     break
 
         weather_scene_map = dict()
         for scene in bridge.groups.zone.get_scenes(weather_id):
-            scene_name = scene.metadata.name.lower()
+            scene_name = normalize_string(scene.metadata.name)
             scene_id = scene.id
 
             weather_scene_map[scene_name] = scene_id
@@ -295,7 +303,7 @@ async def weather_light_routine(bridge):
                 weather_api_response = call_weather_api()
                 parse_sunset_time_and_update(weather_api_response)
 
-                cur_weather = str(weather_api_response.json().get("weather")[0].get("main")).lower()
+                cur_weather = normalize_string(str(weather_api_response.json().get("weather")[0].get("main")))
                 logging.debug(f"current weather: {cur_weather}")
 
                 # animate lights for inside/outside temp difference
@@ -434,7 +442,7 @@ async def schedules_routine(bridge):
         living_area_group_id = None
         for group in bridge.groups:
             if isinstance(group, Zone):
-                if group.metadata.name.lower() == "living area":
+                if normalize_string(group.metadata.name) == normalize_string("living area"):
                     living_area_group_id = group.grouped_light
                     break
 
@@ -531,62 +539,64 @@ def parse_sunset_time_and_update(weather_api_response):
         return None
 
 
-async def bathroom_off_subscriber(event_type, item):
-    try:
-        if isinstance(item, Motion):
-            if item.id == bathroom_motion_id and item.motion.motion_report.motion is False:
-                bathroom_door_opened = \
-                    bridge.sensors.contact.get(
-                        bathroom_contact_id).contact_report.state == ContactState.NO_CONTACT
+# async def utility_off_subscriber(event_type, item, room_name):
+#     try:
+#         if isinstance(item, Motion):
+#             if item.id == room_motion_id and item.motion.motion_report.motion is False:
+#                 room_door_opened = \
+#                     bridge.sensors.contact.get(
+#                         room_contact_id).contact_report.state == ContactState.NO_CONTACT
+#
+#                 if room_door_opened:
+#                     logging.debug(f"turning utility room: {room_name} off because no motion")
+#                     # await bridge.groups.grouped_light.set_state(group_id, False)
+#     except Exception as ex:
+#         logging.debug(msg=f"error checking {room_name} motion", exc_info=ex)
 
-                if bathroom_door_opened:
-                    logging.debug("turning bathroom off because no motion")
-                    await bridge.groups.grouped_light.set_state(bathroom_group_id, False)
-    except Exception as ex:
-        logging.debug(msg=f"error checking bathroom motion", exc_info=ex)
 
-
-# turn off bathroom lights when not needed
-async def bathroom_auto_light_routine(bridge):
+# turn off lights in a room when there is no motion and door is open
+# (need a motion sensor and door contact sensor set up for the room)
+async def utility_off_routine(bridge, utility_room_name):
     # setup
     try:
-        bathroom_group_id = ""
+        utility_room_group_id = ""
+        utility_room_name = normalize_string(utility_room_name)
         for group in bridge.groups:
             if isinstance(group, Room):
-                if group.metadata.name.lower() == "bathroom":
-                    bathroom_group_id = group.grouped_light
+                if normalize_string(group.metadata.name) == utility_room_name:
+                    utility_room_group_id = group.grouped_light
                     break
 
     except Exception as ex:
-        logging.debug(msg=f"error setting up bathroom light routine", exc_info=ex)
+        logging.debug(msg=f"error setting up utility off routine {utility_room_name}", exc_info=ex)
         return
 
     while True:
         try:
-            logging.debug("checking bathroom light state")
+            logging.debug(f"checking {utility_room_name} light state")
 
-            bathroom_group_state = bridge.groups.grouped_light.get(bathroom_group_id)
-            bathroom_is_on = bathroom_group_state.on.on
-            logging.debug(f"bathroom_is_on: {bathroom_is_on}")
+            utility_room_group_state = bridge.groups.grouped_light.get(utility_room_group_id)
+            utility_room_is_on = utility_room_group_state.on.on
+            logging.debug(f"{utility_room_name} is on?: {utility_room_is_on}")
 
-            if bathroom_is_on:
+            if utility_room_is_on:
 
-                bathroom_door_opened = \
+                utility_room_door_opened = \
                     bridge.sensors.contact.get(
-                        bathroom_contact_id).contact_report.state == ContactState.NO_CONTACT
-                bathroom_no_motion = \
-                    bridge.sensors.motion.get(bathroom_motion_id).motion.motion_report.motion is False
-                logging.debug(f"bathroom_door_opened: {bathroom_door_opened}")
-                logging.debug(f"bathroom_no_motion: {bathroom_no_motion}")
+                        utility_room_contact_id).contact_report.state == ContactState.NO_CONTACT
+                utility_room_no_motion = \
+                    bridge.sensors.motion.get(utility_room_motion_id).motion.motion_report.motion is False
+                logging.debug(f"{utility_room_name} door is open?: {utility_room_door_opened}")
+                logging.debug(f"{utility_room_name} has no motion?: {utility_room_no_motion}")
 
-                if bathroom_door_opened and bathroom_no_motion:
-                    logging.debug("turning bathroom off")
-                    await bridge.groups.grouped_light.set_state(bathroom_group_id, False)
+                if utility_room_door_opened and utility_room_no_motion:
+                    logging.debug(f"turning {utility_room_name} off")
+                    await bridge.groups.grouped_light.set_state(utility_room_group_id, False)
 
         except Exception as ex:
-            logging.debug(msg=f"error checking bathroom lights", exc_info=ex)
+            logging.debug(msg=f"error checking lights in {utility_room_name} for utility off routine", exc_info=ex)
 
-        await asyncio.sleep(bathroom_update_time_secs)
+        await asyncio.sleep(utility_room_update_time_secs)
 
 
 def get_adjusted_brightness(brightness, brightness_adj):
@@ -599,8 +609,12 @@ def get_adjusted_brightness(brightness, brightness_adj):
 
 
 def normalize_holiday_name(holiday):
-    new_holiday = holiday.lower().replace(" ", "").replace("'", "").replace(".", "").replace("day", "")
+    new_holiday = normalize_string(holiday).replace("'", "").replace(".", "").replace("day", "")
     return "juneteenth" if new_holiday.startswith("juneteenth") else new_holiday
+
+
+def normalize_string(input_string: str):
+    return input_string.lower().replace(" ", "")
 
 
 with contextlib.suppress(KeyboardInterrupt):
