@@ -25,10 +25,17 @@ parser = argparse.ArgumentParser(description="Hue Routines")
 parser.add_argument("--debug", help="enable debug logging", action="store_true")
 args = parser.parse_args()
 
+bridge = HueBridgeV2(bridge_ip, hue_app_key)
+
+weather_group_name = "weather"
+weather_group_id = None
+weather_id = None
+weather_scene_map = None
+
 hour_min_format = "%H:%M"
+
 time_based_scene_name = "Time Based Scene"
 scene_start_time_sunset = "Sunset"
-scene_start_time_before_sunset = "Before Sunset"
 living_area_auto_time_scene_id = None
 living_area_time_scenes_map = None
 living_area_scene_datetimes_sorted = None
@@ -37,13 +44,12 @@ living_area_id = None
 sunset_datetime = None
 last_fetched_sunset_time = None
 
+state = "NY"
 holiday_group_id = None
 holiday_id = None
 holiday_scene_map = dict()
 holiday_last_on_datetime = None
-us_ny_holidays = CustomHolidays(subdiv='NY', observed=False)
-
-bridge = HueBridgeV2(bridge_ip, hue_app_key)
+us_and_state_holidays = CustomHolidays(subdiv=state, observed=False)
 
 
 async def main():
@@ -69,7 +75,7 @@ async def main():
         bridge = b
         logging.debug(f"Connected to bridge: {bridge.bridge_id}")
 
-        update_variables(bridge)
+        update_vars(bridge)
 
         bridge.subscribe(holiday_subscriber)
         if living_area_auto_time_scene_id is not None:
@@ -78,11 +84,218 @@ async def main():
         # run all routines in background continuously
         async with asyncio.TaskGroup() as tg:
             tg.create_task(update_variables_routine(bridge))
-            tg.create_task(weather_light_routine(bridge))
             tg.create_task(schedules_routine(bridge))
+            tg.create_task(weather_light_routine(bridge))
             if utility_off_rooms:
                 for utility_room in utility_off_rooms:
                     tg.create_task(utility_off_routine(bridge, utility_room))
+
+
+async def update_variables_routine(bridge):
+    while True:
+        await asyncio.sleep(60 * 15)  # update every 15 mins
+        update_vars(bridge)
+
+
+def update_vars(bridge):
+    try:
+        update_weather_vars(bridge)
+        update_holiday_vars(bridge)
+        update_time_based_scene_vars(bridge)
+
+    except Exception as ex:
+        logging.debug(msg=f"error updating global variables", exc_info=ex)
+
+
+def update_time_based_scene_vars(bridge):
+    global living_area_id
+    global living_area_time_scenes_map
+    global living_area_scene_datetimes_sorted
+    global living_area_auto_time_scene_id
+
+    try:
+        for group in bridge.groups:
+            if isinstance(group, Zone):
+                if normalize_string(group.metadata.name) == normalize_string("living area"):
+                    # setup auto time-based scenes for living area
+                    living_area_time_scenes_map = {}
+                    living_area_id = group.id
+                    for scene in bridge.groups.zone.get_scenes(living_area_id):
+                        scene_name = scene.metadata.name
+                        if normalize_string(scene_name) == normalize_string(time_based_scene_name):
+                            living_area_auto_time_scene_id = scene.id
+                        add_scene_to_time_map(living_area_time_scenes_map, scene_name, scene.id)
+                    break
+
+        if living_area_time_scenes_map is not None and len(living_area_time_scenes_map) != 0:
+            # setup sorted scene datetimes to be used for auto time-based scenes
+            current_datetime = get_current_datetime()
+            living_area_scene_datetimes_sorted = []
+            tz = timezone(my_timezone)
+            for scene_time in living_area_time_scenes_map:
+                scene_datetime = (datetime.strptime(scene_time, hour_min_format)
+                                  .replace(year=current_datetime.year,
+                                           month=current_datetime.month,
+                                           day=current_datetime.day))
+                scene_datetime = tz.localize(scene_datetime)
+                living_area_scene_datetimes_sorted.append(scene_datetime)
+            living_area_scene_datetimes_sorted.sort(reverse=True)
+            logging.debug(f"sorted datetimes: {living_area_scene_datetimes_sorted}")
+
+    except Exception as ex:
+        logging.debug(msg=f"error updating time-based scene variables", exc_info=ex)
+
+
+def update_holiday_vars(bridge):
+    global holiday_group_id
+    global holiday_id
+
+    try:
+        for group in bridge.groups:
+            if isinstance(group, Zone):
+                if normalize_string(group.metadata.name) == normalize_string(holiday_zone_name):
+                    holiday_group_id = group.grouped_light
+                    holiday_id = group.id
+                    break
+
+    except Exception as ex:
+        logging.debug(msg=f"error updating holiday variables", exc_info=ex)
+
+
+def update_weather_vars(bridge):
+    global weather_group_id
+    global weather_id
+    global weather_scene_map
+    global weather_group_name
+
+    try:
+        for group in bridge.groups:
+            if isinstance(group, Zone):
+                if normalize_string(group.metadata.name) == weather_group_name:
+                    weather_group_id = group.grouped_light
+                    weather_id = group.id
+                    break
+
+        if not weather_group_id or not weather_id:
+            return
+
+        weather_scene_map = dict()
+        for scene in bridge.groups.zone.get_scenes(weather_id):
+            scene_name = normalize_string(scene.metadata.name)
+            scene_id = scene.id
+
+            weather_scene_map[scene_name] = scene_id
+
+        logging.debug(f"weather_scene_map: {weather_scene_map}")
+
+    except Exception as ex:
+        logging.debug(msg=f"error updating weather variables", exc_info=ex)
+        return
+
+
+def add_scene_to_time_map(time_scenes_map, scene_name, scene_id):
+    try:
+        # Example scene names with time: "Evening (8pm)", "Evening (Sunset + 30m)"
+        # time in parentheses will be used as scene start time
+        name_parts = scene_name.split("(")
+        if len(name_parts) > 1:
+            scene_start_time = normalize_string(name_parts[1].split(")")[0])
+            if normalize_string(scene_start_time_sunset) in scene_start_time:
+                # start time in scene name uses sunset offset time
+                scene_start_datetime = parse_sunset_offset_time_from_scene_name(scene_start_time, scene_name)
+            else:
+                # start time in scene name is in hour:min am/pm format
+                normalized_scene_start_time = normalize_am_pm_time(scene_start_time)
+                scene_start_datetime = datetime.strptime(normalized_scene_start_time, "%I:%M %p")
+            logging.debug(f"scene_name: {scene_name}, scene_start_datetime: {scene_start_datetime}")
+
+            # map format: { scene start time -> scene id }
+            time_string = scene_start_datetime.strftime(hour_min_format)
+            time_scenes_map[time_string] = scene_id
+    except Exception as ex:
+        logging.debug(msg=f"error parsing scene name:{scene_name} when adding to time scenes map", exc_info=ex)
+        return
+
+
+def parse_sunset_offset_time_from_scene_name(scene_start_time: str, full_scene_name: str):
+    scene_start_datetime = get_sunset_time()
+    if len(scene_start_time) == len(scene_start_time_sunset):
+        # start time is just "sunset"
+        return scene_start_datetime
+
+    # get offset from sunset time in scene name
+    is_positive_offset = True
+    positive_offset = scene_start_time.split("+")
+
+    if len(positive_offset) > 1:
+        offset = positive_offset[1]
+    else:
+        negative_offset = scene_start_time.split("-")
+        if len(negative_offset) > 1:
+            offset = negative_offset[1]
+            is_positive_offset = False
+        else:
+            raise Exception(f"scene_start_time: '{scene_start_time}' does not contain + or -")
+
+    index = 0
+    while index < len(offset):
+        if offset[index] == "h" or offset[index] == "m":
+            break
+        index += 1
+    if index == 0 or index == len(offset):
+        raise Exception(f"could not find time unit 'h' or 'm' in offset: {offset}")
+
+    offset_amount = int(offset[:index])
+    if not is_positive_offset:
+        offset_amount = -offset_amount
+    if offset[index] == "h":
+        scene_start_datetime = scene_start_datetime + timedelta(hours=offset_amount)
+    else:
+        # offset has 'm' so is in minutes
+        scene_start_datetime = scene_start_datetime + timedelta(minutes=offset_amount)
+
+    return scene_start_datetime
+
+
+def normalize_am_pm_time(time_string):
+    time_string = normalize_string(time_string)
+    time_parts = time_string.split("a")
+    time_is_am = False
+    if len(time_parts) > 1:
+        time_is_am = True
+        time_string = time_parts[0]
+    else:
+        time_string = time_string.split("p")[0]
+
+    split_on_colon = time_string.split(":")
+    if len(split_on_colon) == 1:
+        time_string = time_string + ":00"
+    if len(time_string) == 4:
+        time_string = "0" + time_string
+    time_string = time_string + " "
+    if time_is_am:
+        time_string = time_string + "AM"
+    else:
+        time_string = time_string + "PM"
+
+    return time_string
+
+
+def update_holiday_scenes():
+    global holiday_scene_map
+    holiday_scene_map = dict()
+    for scene in bridge.groups.zone.get_scenes(holiday_id):
+        scene_name = normalize_holiday_name(scene.metadata.name)
+        holiday_scene_map[scene_name] = scene.id
+    return holiday_scene_map
+
+
+def discover_scenes_in_zone(zone_id):
+    scene_map = dict()
+    for scene in bridge.groups.zone.get_scenes(zone_id):
+        scene_name = normalize_string(scene.metadata.name)
+        scene_map[scene_name] = scene.id
+    return scene_map
 
 
 async def auto_time_scenes_subscriber(event_type, item):
@@ -127,7 +340,7 @@ async def holiday_subscriber(event_type, item):
                 update_holiday_scenes()
 
                 current_date = current_datetime.strftime('%Y-%m-%d')
-                holiday = us_ny_holidays.get(current_date)
+                holiday = us_and_state_holidays.get(current_date)
 
                 if holiday is not None:
                     logging.debug(f"it's a holiday! {holiday}")
@@ -143,154 +356,21 @@ async def holiday_subscriber(event_type, item):
         logging.debug(msg=f"error activating holiday lights", exc_info=ex)
 
 
-async def update_variables_routine(bridge):
-    while True:
-        await asyncio.sleep(60 * 15)
-        update_variables(bridge)
-
-
-def update_variables(bridge):
-    global holiday_group_id
-    global holiday_id
-    global living_area_id
-    global living_area_time_scenes_map
-    global living_area_scene_datetimes_sorted
-    global living_area_auto_time_scene_id
-
-    try:
-        for group in bridge.groups:
-            if isinstance(group, Zone):
-                if normalize_string(group.metadata.name) == normalize_string(holiday_zone_name):
-                    holiday_group_id = group.grouped_light
-                    holiday_id = group.id
-                    break
-
-        for group in bridge.groups:
-            if isinstance(group, Zone):
-                if normalize_string(group.metadata.name) == normalize_string("living area"):
-                    # setup auto time-based scenes for living area
-                    living_area_time_scenes_map = {}
-                    living_area_id = group.id
-                    for scene in bridge.groups.zone.get_scenes(living_area_id):
-                        scene_name = scene.metadata.name
-                        if normalize_string(scene_name) == normalize_string(time_based_scene_name):
-                            living_area_auto_time_scene_id = scene.id
-                        add_scene_to_time_map(living_area_time_scenes_map, scene_name, scene.id)
-                    break
-
-        if living_area_time_scenes_map is not None and len(living_area_time_scenes_map) != 0:
-            # setup sorted scene datetimes to be used for auto time-based scenes
-            current_datetime = get_current_datetime()
-            living_area_scene_datetimes_sorted = []
-            tz = timezone(my_timezone)
-            for scene_time in living_area_time_scenes_map:
-                scene_datetime = (datetime.strptime(scene_time, hour_min_format)
-                                  .replace(year=current_datetime.year,
-                                           month=current_datetime.month,
-                                           day=current_datetime.day))
-                scene_datetime = tz.localize(scene_datetime)
-                living_area_scene_datetimes_sorted.append(scene_datetime)
-            living_area_scene_datetimes_sorted.sort(reverse=True)
-            logging.debug(f"sorted datetimes: {living_area_scene_datetimes_sorted}")
-
-    except Exception as ex:
-        logging.debug(msg=f"error updating global variables", exc_info=ex)
-
-
-def add_scene_to_time_map(time_scenes_map, scene_name, scene_id):
-    try:
-        # Example scene name with time: "Evening (8pm)"
-        # time in parentheses will be used as scene start time
-        name_parts = scene_name.split("(")
-        if len(name_parts) > 1:
-            scene_start_time = normalize_string(name_parts[1].split(")")[0])
-            if scene_start_time == normalize_string(scene_start_time_sunset):
-                scene_start_datetime = get_sunset_scene_start_time()
-            elif scene_start_time == normalize_string(scene_start_time_before_sunset):
-                scene_start_datetime = get_before_sunset_scene_start_time(get_sunset_scene_start_time())
-            else:
-                normalized_scene_start_time = normalize_am_pm_time(scene_start_time)
-                scene_start_datetime = datetime.strptime(normalized_scene_start_time, "%I:%M %p")
-            logging.debug(f"scene_name: {scene_name}, scene_start_datetime: {scene_start_datetime}")
-
-            # map format: { scene start time -> scene id }
-            time_string = scene_start_datetime.strftime(hour_min_format)
-            time_scenes_map[time_string] = scene_id
-    except Exception as ex:
-        logging.debug(msg=f"error parsing scene name:{scene_name} when adding to time scenes map", exc_info=ex)
-        return
-
-
-def normalize_am_pm_time(time_string):
-    time_string = normalize_string(time_string)
-    time_parts = time_string.split("a")
-    time_is_am = False
-    if len(time_parts) > 1:
-        time_is_am = True
-        time_string = time_parts[0]
-    else:
-        time_string = time_string.split("p")[0]
-
-    split_on_colon = time_string.split(":")
-    if len(split_on_colon) == 1:
-        time_string = time_string + ":00"
-    if len(time_string) == 4:
-        time_string = "0" + time_string
-    time_string = time_string + " "
-    if time_is_am:
-        time_string = time_string + "AM"
-    else:
-        time_string = time_string + "PM"
-
-    return time_string
-
-
-def update_holiday_scenes():
-    global holiday_scene_map
-    holiday_scene_map = dict()
-    for scene in bridge.groups.zone.get_scenes(holiday_id):
-        scene_name = normalize_holiday_name(scene.metadata.name)
-        holiday_scene_map[scene_name] = scene.id
-    return holiday_scene_map
-
-
-def discover_scenes_in_zone(zone_id):
-    scene_map = dict()
-    for scene in bridge.groups.zone.get_scenes(zone_id):
-        scene_name = normalize_string(scene.metadata.name)
-        scene_map[scene_name] = scene.id
-    return scene_map
-
-
 # change my light depending on weather
 async def weather_light_routine(bridge):
-    # setup
-    try:
-        weather_group_id = ""
-        weather_id = ""
-        for group in bridge.groups:
-            if isinstance(group, Zone):
-                if normalize_string(group.metadata.name) == "weather":
-                    weather_group_id = group.grouped_light
-                    weather_id = group.id
-                    break
-
-        weather_scene_map = dict()
-        for scene in bridge.groups.zone.get_scenes(weather_id):
-            scene_name = normalize_string(scene.metadata.name)
-            scene_id = scene.id
-
-            weather_scene_map[scene_name] = scene_id
-            logging.debug(f"added '{scene_name}' weather scene to map")
-        default_scene_id = weather_scene_map.get("default")
-
-    except Exception as ex:
-        logging.debug(msg=f"error setting up weather light routine", exc_info=ex)
-        return
+    global weather_group_name
+    global weather_group_id
+    global weather_id
+    global weather_scene_map
 
     # run routine
     while True:
         try:
+            if not weather_scene_map:
+                return
+
+            default_scene_id = weather_scene_map.get("default")
+
             # if weather scene isn't on, don't do anything
             weather_zone_state = bridge.groups.grouped_light.get(weather_group_id)
             weather_zone_is_on = weather_zone_state.on.on
@@ -330,18 +410,11 @@ async def weather_light_routine(bridge):
                         logging.debug(f"outside temp is close to inside temp")
                         temp_scene = weather_temp_same_scene
 
-                    start_brightness = get_adjusted_brightness(brightness=prev_weather_zone_brightness,
-                                                               brightness_adj=weather_temp_brightness_diff)
                     temp_scene_id = weather_scene_map.get(temp_scene)
                     if temp_scene_id is None:
                         raise Exception(f"could not find scene named '{temp_scene}'")
 
-                    # show color for temp diff, dim slightly
-                    await bridge.scenes.recall(temp_scene_id,
-                                               duration=weather_transition_time_ms,
-                                               brightness=start_brightness)
-                    await asyncio.sleep(1)
-                    # bring back to same brightness as before
+                    # show color for temp diff
                     await bridge.scenes.recall(temp_scene_id,
                                                duration=weather_transition_time_ms,
                                                brightness=prev_weather_zone_brightness)
@@ -358,7 +431,9 @@ async def weather_light_routine(bridge):
                         scene_id = default_scene_id
 
                 if scene_id is not None:
-                    # turn on correct weather scene and don't change brightness
+                    # refetch current light brightness in case it was changed in the meantime
+                    prev_weather_zone_brightness = bridge.groups.grouped_light.get(weather_group_id).dimming.brightness
+                    # turn on correct weather scene
                     await bridge.scenes.recall(scene_id,
                                                duration=weather_transition_time_ms,
                                                brightness=prev_weather_zone_brightness)
@@ -483,23 +558,22 @@ def get_current_datetime():
     return datetime.now(timezone(my_timezone))
 
 
-def get_sunset_scene_start_time():
+def get_sunset_time():
     global sunset_datetime
     if sunset_datetime is None \
             or sunset_datetime.date() != get_current_datetime().date():
         try:
-            return fetch_sunset_time_from_api() + timedelta(minutes=evening_scene_sunset_offset_minutes)
+            return fetch_sunset_time_from_api()
 
         except Exception as ex:
             logging.debug(msg="error updating sunset time", exc_info=ex)
 
     if sunset_datetime is not None:
-        start_time = sunset_datetime + timedelta(minutes=evening_scene_sunset_offset_minutes)
+        sunset_time = sunset_datetime
     else:
-        start_time = datetime.today().replace(hour=evening_scene_switchover_fallback_hour,
-                                              minute=evening_scene_switchover_fallback_minute) + \
-                     timedelta(minutes=evening_scene_sunset_offset_minutes)
-    return start_time
+        sunset_time = datetime.today().replace(hour=evening_scene_switchover_fallback_hour,
+                                               minute=evening_scene_switchover_fallback_minute)
+    return sunset_time
 
 
 def get_before_sunset_scene_start_time(sunset_scene_start_time):
