@@ -9,8 +9,10 @@ from datetime import datetime, timedelta
 import requests
 from aiohue import HueBridgeV2
 from aiohue.v2 import EventType
+from aiohue.v2.models.button import ButtonEvent
 from aiohue.v2.models.contact import ContactState
 from aiohue.v2.models.grouped_light import GroupedLight
+from aiohue.v2.models.resource import ResourceTypes
 from aiohue.v2.models.room import Room
 from aiohue.v2.models.zone import Zone
 from pytz import timezone
@@ -25,8 +27,12 @@ args = parser.parse_args()
 
 bridge = HueBridgeV2(bridge_ip, hue_app_key)
 
-room_id_map = None
-room_grouped_light_id_map = None
+room_name_to_type_map = None
+room_type_zone = "zone"
+room_type_room = "room"
+
+room_name_to_id_map = None
+room_name_to_grouped_light_id_map = None
 
 weather_group_name = "weather"
 weather_group_id = None
@@ -38,15 +44,12 @@ hour_min_format = "%H:%M"
 rooms_to_time_scenes_map = None
 rooms_to_time_scene_datetimes_sorted_map = None
 
-time_based_scene_name = "Time Based Scene"
 scene_start_time_sunset = "Sunset"
-living_area_time_based_scene_id = None
-living_area_time_scenes_map = None
-living_area_scene_datetimes_sorted = None
-living_area_auto_scene_id = None
-living_area_id = None
 sunset_datetime = None
 last_fetched_sunset_time = None
+
+motion_id_to_room_map = None
+button_id_to_room_map = None
 
 state = "NY"
 holiday_group_id = None
@@ -54,9 +57,6 @@ holiday_id = None
 holiday_scene_map = dict()
 holiday_last_on_datetime = None
 us_and_state_holidays = CustomHolidays(subdiv=state, observed=False)
-
-room_to_motion_id_map = None
-inverse_room_to_motion_id_map = None
 
 
 async def main():
@@ -85,19 +85,22 @@ async def main():
         update_vars(bridge)
 
         bridge.subscribe(holiday_subscriber)
-        if living_area_time_based_scene_id is not None:
-            bridge.scenes.subscribe(auto_time_scenes_subscriber, id_filter=living_area_time_based_scene_id)
 
         # run all routines in background continuously
         async with asyncio.TaskGroup() as tg:
             tg.create_task(update_variables_routine(bridge))
-            tg.create_task(schedules_routine(bridge))
             tg.create_task(weather_light_routine(bridge))
-            if room_to_motion_id_map:
-                for key_room in room_to_motion_id_map:
+            if hue_config.scheduled_scene_change_rooms:
+                tg.create_task(schedules_routine(bridge, scheduled_scene_change_rooms))
+            if motion_id_to_room_map:
+                for key_motion_id in motion_id_to_room_map:
                     bridge.sensors.motion.subscribe(motion_time_based_subscriber,
-                                                    id_filter=room_to_motion_id_map[key_room],
+                                                    id_filter=key_motion_id,
                                                     event_filter=EventType.RESOURCE_UPDATED)
+            if button_id_to_room_map:
+                for key_button_id in button_id_to_room_map:
+                    bridge.sensors.button.subscribe(button_time_based_subscriber,
+                                                    id_filter=key_button_id)
             if utility_off_rooms:
                 for utility_room in utility_off_rooms:
                     tg.create_task(utility_off_routine(bridge, utility_room))
@@ -113,8 +116,9 @@ def update_vars(bridge):
     try:
         update_weather_vars(bridge)
         update_holiday_vars(bridge)
-        update_time_based_scene_vars(bridge)
+        update_time_based_scene_map_vars(bridge)
         update_motion_time_based_vars(bridge)
+        update_button_time_based_vars(bridge)
         update_room_id_map(bridge)
 
     except Exception as ex:
@@ -122,35 +126,87 @@ def update_vars(bridge):
 
 
 def update_room_id_map(bridge):
-    global room_id_map
-    global room_grouped_light_id_map
+    global room_name_to_id_map
+    global room_name_to_grouped_light_id_map
     try:
-        room_id_map = {}
-        room_grouped_light_id_map = {}
+        room_name_to_id_map = {}
+        room_name_to_grouped_light_id_map = {}
         for room in bridge.groups.room:
             room_name = normalize_string(room.metadata.name)
-            room_grouped_light_id_map[room_name] = room.grouped_light
-            room_id_map[room_name] = room.id
+            room_name_to_grouped_light_id_map[room_name] = room.grouped_light
+            room_name_to_id_map[room_name] = room.id
+        for room in bridge.groups.zone:
+            room_name = normalize_string(room.metadata.name)
+            room_name_to_grouped_light_id_map[room_name] = room.grouped_light
+            room_name_to_id_map[room_name] = room.id
 
     except Exception as ex:
         logging.debug(msg=f"error updating room id map", exc_info=ex)
 
 
-def update_motion_time_based_vars(bridge):
-    global room_to_motion_id_map
-    global inverse_room_to_motion_id_map
+def update_time_based_scene_map_vars(bridge):
+    global room_name_to_type_map
     global rooms_to_time_scenes_map
     global rooms_to_time_scene_datetimes_sorted_map
 
-    if rooms_to_time_scenes_map is None:
-        rooms_to_time_scenes_map = {}
-    if rooms_to_time_scene_datetimes_sorted_map is None:
-        rooms_to_time_scene_datetimes_sorted_map = {}
+    room_name_to_type_map = {}
+    rooms_to_time_scenes_map = {}
+    rooms_to_time_scene_datetimes_sorted_map = {}
+
+    for group in bridge.groups:
+        # setup auto time-based scenes for room
+        if isinstance(group, Zone):
+            room_type = room_type_zone
+        elif isinstance(group, Room):
+            room_type = room_type_room
+        else:
+            room_type = None
+        if not room_type:
+            continue
+
+        room_name = normalize_string(group.metadata.name)
+        room_name_to_type_map[room_name] = room_type
+
+        room_time_scenes_map = {}
+        group_id = group.id
+        if room_type == room_type_zone:
+            scenes = bridge.groups.zone.get_scenes(group_id)
+        else:
+            # must be room type and not zone
+            scenes = bridge.groups.room.get_scenes(group_id)
+        for scene in scenes:
+            scene_name = scene.metadata.name
+            add_scene_to_time_map(room_time_scenes_map, scene_name, scene.id)
+
+        if room_time_scenes_map is not None and len(room_time_scenes_map) != 0:
+            logging.debug(f"{room_name} updated room_time_scenes_map : {room_time_scenes_map}")
+            # setup sorted scene datetimes to be used for time-based scenes
+            current_datetime = get_current_datetime()
+            room_scene_datetimes_sorted = []
+            tz = timezone(my_timezone)
+            for scene_time in room_time_scenes_map:
+                scene_datetime = (datetime.strptime(scene_time, hour_min_format)
+                                  .replace(year=current_datetime.year,
+                                           month=current_datetime.month,
+                                           day=current_datetime.day))
+                scene_datetime = tz.localize(scene_datetime)
+                room_scene_datetimes_sorted.append(scene_datetime)
+            room_scene_datetimes_sorted.sort(reverse=True)
+            logging.debug(f"{room_name} sorted datetimes: {room_scene_datetimes_sorted}")
+
+            # set time based scenes for room in global map
+            rooms_to_time_scenes_map[room_name] = room_time_scenes_map
+            rooms_to_time_scene_datetimes_sorted_map[room_name] = room_scene_datetimes_sorted
+    logging.debug(f"updated rooms_to_time_scenes_map: {rooms_to_time_scenes_map}")
+    logging.debug(f"updated rooms_to_time_scene_datetimes_sorted_map: {rooms_to_time_scene_datetimes_sorted_map}")
+
+
+def update_button_time_based_vars(bridge):
+    global button_id_to_room_map
 
     try:
-        if hue_config.motion_time_based_rooms:
-            room_to_motion_id_map = {}
-            inverse_room_to_motion_id_map = {}
+        if hue_config.button_time_based_rooms:
+            button_id_to_room_map = {}
             rooms = set()
             for room_name in motion_time_based_rooms:
                 rooms.add(normalize_string(room_name))
@@ -158,83 +214,45 @@ def update_motion_time_based_vars(bridge):
                 sensor_name = normalize_string(bridge.sensors.get_device(id=motion_sensor.id).metadata.name)
                 for room in rooms:
                     if room in sensor_name:
-                        room_to_motion_id_map[room] = motion_sensor.id
-                        inverse_room_to_motion_id_map[motion_sensor.id] = room
+                        motion_id_to_room_map[motion_sensor.id] = room
+            for button_config in button_time_based_rooms:
+                room_name = normalize_string(button_config[0])
+                device_name = normalize_string(button_config[1])
+                button_control_id = button_config[2]
+                for device in bridge.devices:
+                    if device.metadata and device.metadata.name and normalize_string(
+                            device.metadata.name) == device_name:
+                        for resource in device.services:
+                            if resource.rtype == ResourceTypes.BUTTON:
+                                button = bridge.sensors.button.get(id=resource.rid)
+                                if button.metadata.control_id == button_control_id:
+                                    button_id = button.id
+                                    button_id_to_room_map[button_id] = [room_name, device_name, button_control_id]
+                        break
 
-            for group in bridge.groups:
-                if isinstance(group, Room):
-                    for room in rooms:
-                        if normalize_string(group.metadata.name) == normalize_string(room):
-                            # setup auto time-based scenes for room
-                            room_time_scenes_map = {}
-                            group_id = group.id
-                            for scene in bridge.groups.room.get_scenes(group_id):
-                                scene_name = scene.metadata.name
-                                add_scene_to_time_map(room_time_scenes_map, scene_name, scene.id)
-
-                            logging.debug(f"{room} updated room_time_scenes_map : {room_time_scenes_map}")
-                            if room_time_scenes_map is not None and len(room_time_scenes_map) != 0:
-                                # setup sorted scene datetimes to be used for time-based scenes
-                                current_datetime = get_current_datetime()
-                                room_scene_datetimes_sorted = []
-                                tz = timezone(my_timezone)
-                                for scene_time in room_time_scenes_map:
-                                    scene_datetime = (datetime.strptime(scene_time, hour_min_format)
-                                                      .replace(year=current_datetime.year,
-                                                               month=current_datetime.month,
-                                                               day=current_datetime.day))
-                                    scene_datetime = tz.localize(scene_datetime)
-                                    room_scene_datetimes_sorted.append(scene_datetime)
-                                room_scene_datetimes_sorted.sort(reverse=True)
-                                logging.debug(f"{room} sorted datetimes: {room_scene_datetimes_sorted}")
-
-                                # set time based scenes for room in higher level map
-                                rooms_to_time_scenes_map[room] = room_time_scenes_map
-                                rooms_to_time_scene_datetimes_sorted_map[room] = room_scene_datetimes_sorted
+            logging.debug(f"updated button_id_to_room_map: {button_id_to_room_map}")
 
     except Exception as ex:
         logging.debug(msg=f"error updating motion time based variables", exc_info=ex)
 
 
-def update_time_based_scene_vars(bridge):
-    global living_area_id
-    global living_area_time_scenes_map
-    global living_area_scene_datetimes_sorted
-    global living_area_time_based_scene_id
+def update_motion_time_based_vars(bridge):
+    global motion_id_to_room_map
 
     try:
-        for group in bridge.groups:
-            if isinstance(group, Zone):
-                if normalize_string(group.metadata.name) == normalize_string("living area"):
-                    # setup auto time-based scenes for living area
-                    living_area_time_scenes_map = {}
-                    living_area_id = group.id
-                    for scene in bridge.groups.zone.get_scenes(living_area_id):
-                        scene_name = scene.metadata.name
-                        if normalize_string(scene_name) == normalize_string(time_based_scene_name):
-                            living_area_time_based_scene_id = scene.id
-                        add_scene_to_time_map(living_area_time_scenes_map, scene_name, scene.id)
-                    break
-
-        logging.debug(f"updated living_area_time_scenes_map: {living_area_time_scenes_map}")
-
-        if living_area_time_scenes_map is not None and len(living_area_time_scenes_map) != 0:
-            # setup sorted scene datetimes to be used for auto time-based scenes
-            current_datetime = get_current_datetime()
-            living_area_scene_datetimes_sorted = []
-            tz = timezone(my_timezone)
-            for scene_time in living_area_time_scenes_map:
-                scene_datetime = (datetime.strptime(scene_time, hour_min_format)
-                                  .replace(year=current_datetime.year,
-                                           month=current_datetime.month,
-                                           day=current_datetime.day))
-                scene_datetime = tz.localize(scene_datetime)
-                living_area_scene_datetimes_sorted.append(scene_datetime)
-            living_area_scene_datetimes_sorted.sort(reverse=True)
-            logging.debug(f"sorted datetimes: {living_area_scene_datetimes_sorted}")
+        if hue_config.motion_time_based_rooms:
+            motion_id_to_room_map = {}
+            rooms = set()
+            for room_name in motion_time_based_rooms:
+                rooms.add(normalize_string(room_name))
+            for motion_sensor in bridge.sensors.motion:
+                sensor_name = normalize_string(bridge.sensors.get_device(id=motion_sensor.id).metadata.name)
+                for room in rooms:
+                    if room in sensor_name:
+                        motion_id_to_room_map[motion_sensor.id] = room
 
     except Exception as ex:
-        logging.debug(msg=f"error updating time-based scene variables", exc_info=ex)
+        logging.debug(msg=f"error updating motion time based variables", exc_info=ex)
 
 
 def update_holiday_vars(bridge):
@@ -293,7 +311,7 @@ def add_scene_to_time_map(time_scenes_map, scene_name, scene_id):
             scene_start_time = normalize_string(name_parts[1].split(")")[0])
             if normalize_string(scene_start_time_sunset) in scene_start_time:
                 # start time in scene name uses sunset offset time
-                scene_start_datetime = parse_sunset_offset_time_from_scene_name(scene_start_time, scene_name)
+                scene_start_datetime = parse_sunset_offset_time_from_scene_name(scene_start_time)
             else:
                 # start time in scene name is in hour:min am/pm format
                 normalized_scene_start_time = normalize_am_pm_time(scene_start_time)
@@ -308,7 +326,7 @@ def add_scene_to_time_map(time_scenes_map, scene_name, scene_id):
         return
 
 
-def parse_sunset_offset_time_from_scene_name(scene_start_time: str, full_scene_name: str):
+def parse_sunset_offset_time_from_scene_name(scene_start_time: str):
     scene_start_datetime = get_sunset_time()
     if len(scene_start_time) == len(scene_start_time_sunset):
         # start time is just "sunset"
@@ -389,44 +407,82 @@ def discover_scenes_in_zone(zone_id):
     return scene_map
 
 
-async def motion_time_based_subscriber(event_type, item):
-    global rooms_to_time_scenes_map
-    global rooms_to_time_scene_datetimes_sorted_map
-
+async def button_time_based_subscriber(event_type, item):
     try:
-        global inverse_room_to_motion_id_map
-        global room_grouped_light_id_map
+        global button_id_to_room_map
+        if item.button.button_report.event == ButtonEvent.INITIAL_PRESS:
+            logging.debug(f"button initial press: {item}")
+            button_id = item.id
+            button_config = button_id_to_room_map[button_id]
+            room_name = button_config[0]
+            # device_name = button_config[1]
+            # button_control_id = button_config[2]
+            room_group_id = room_name_to_grouped_light_id_map[room_name]
+            grouped_light = bridge.groups.grouped_light.get(id=room_group_id)
+
+            if grouped_light.on.on:
+                # light is on, button press turns off
+                await bridge.groups.grouped_light.set_state(id=room_group_id, on=False)
+            else:
+                # light is off, button press turns on to time-based scene
+                logging.debug(f"button press in {room_name} when lights are off, turning lights on")
+                await turn_on_room_to_time_based_scene(room_name=room_name, room_group_id=room_group_id)
+
+    except Exception as ex:
+        logging.debug(msg=f"error processing event for time-based button press", exc_info=ex)
+
+
+async def turn_on_room_to_time_based_scene(room_name: str, room_group_id: str):
+    scene_id = find_time_based_scene_for_current_time(room_name)
+    if scene_id:
+        await bridge.scenes.recall(scene_id)
+    else:
+        await bridge.groups.grouped_light.set_state(id=room_group_id, on=True)
+
+
+def find_time_based_scene_for_current_time(room_name: str):
+    room_time_scenes_map = rooms_to_time_scenes_map[room_name]
+    room_scene_datetimes_sorted = rooms_to_time_scene_datetimes_sorted_map[room_name]
+    if room_time_scenes_map is None or room_scene_datetimes_sorted is None:
+        logging.debug(f"could not find time based scenes for {room_name}, "
+                      f"room_time_scenes_map: {room_time_scenes_map}, "
+                      f"room_scene_datetimes_sorted:{room_scene_datetimes_sorted}")
+        return None
+
+    current_datetime = get_current_datetime()
+    datetime_after = room_scene_datetimes_sorted[0]
+    logging.debug(f"{room_name} default datetime_after: {datetime_after}")
+    logging.debug(f"{room_name} current_datetime to compare to sorted scene times: {current_datetime}")
+    for scene_datetime in room_scene_datetimes_sorted:
+        if current_datetime >= scene_datetime:
+            datetime_after = scene_datetime
+            logging.debug(f"{room_name} found new datetime_after: {datetime_after}")
+            break
+
+    datetime_after_string = datetime_after.strftime(hour_min_format)
+    logging.debug(f"{room_name} datetime_after_string: {datetime_after_string}")
+    scene_id = room_time_scenes_map.get(datetime_after_string)
+    if not scene_id:
+        logging.debug(f"could not find scene_id for datetime_after_string: {datetime_after_string}, "
+                      f"in {room_name}"
+                      f"room_time_scenes_map: {room_time_scenes_map}, "
+                      f"room_scene_datetimes_sorted:{room_scene_datetimes_sorted}")
+    return scene_id
+
+
+async def motion_time_based_subscriber(event_type, item):
+    try:
+        global motion_id_to_room_map
+        global room_name_to_grouped_light_id_map
         if item.motion.motion:
             motion_id = item.id
-            room_name = inverse_room_to_motion_id_map[motion_id]
-            room_group_id = room_grouped_light_id_map[room_name]
+            room_name = motion_id_to_room_map[motion_id]
+            room_group_id = room_name_to_grouped_light_id_map[room_name]
             grouped_light = bridge.groups.grouped_light.get(id=room_group_id)
             if not grouped_light.on.on:
                 # motion while lights are off, turn them on
                 logging.debug(f"detected motion in {room_name} when lights are off, turning lights on")
-                room_time_scenes_map = rooms_to_time_scenes_map[room_name]
-                room_scene_datetimes_sorted = rooms_to_time_scene_datetimes_sorted_map[room_name]
-                if room_time_scenes_map is None or room_scene_datetimes_sorted is None:
-                    logging.debug(f"could not find time based scenes for {room_name}, turning lights on without scene "
-                                  f"room_time_scenes_map: {room_time_scenes_map}, "
-                                  f"room_scene_datetimes_sorted:{room_scene_datetimes_sorted}")
-                    await bridge.groups.grouped_light.set_state(id=room_group_id, on=True)
-                    return
-
-                current_datetime = get_current_datetime()
-                datetime_after = room_scene_datetimes_sorted[0]
-                logging.debug(f"{room_name} default datetime_after: {datetime_after}")
-                logging.debug(f"{room_name} current_datetime to compare to sorted scene times: {current_datetime}")
-                for scene_datetime in room_scene_datetimes_sorted:
-                    if current_datetime >= scene_datetime:
-                        datetime_after = scene_datetime
-                        logging.debug(f"{room_name} found new datetime_after: {datetime_after}")
-                        break
-
-                datetime_after_string = datetime_after.strftime(hour_min_format)
-                logging.debug(f"{room_name} datetime_after_string: {datetime_after_string}")
-                current_scene_id = room_time_scenes_map.get(datetime_after_string)
-                await bridge.scenes.recall(current_scene_id)
+                await turn_on_room_to_time_based_scene(room_name=room_name, room_group_id=room_group_id)
 
     except Exception as ex:
         logging.debug(msg=f"error processing event for time-based motion", exc_info=ex)
@@ -612,23 +668,22 @@ def celsius_to_fahrenheit(temp_celsius: float) -> float:
     return (temp_celsius * 1.8) + 32
 
 
-# change the lights over to an evening scene (only if they are currently on)
+# change the lights over to a new scene at certain times (only if they are currently on)
 # so your lights won't turn on when you're not home :)
 # the hue app doesn't let you make a routine to switch to a scene only if those lights are on :(
 # and custom apps people have built that do it cost money :(
-async def change_zone_scene_at_time_if_lights_on(bridge, time, zone_name, zone_group_id, scene_id):
+async def change_zone_scene_at_time_if_lights_on(bridge, time, room_name, room_group_id, scene_id):
     try:
-        logging.debug(
-            f"the time is {time} so we're changing the scene in zone '{zone_name}' if lights are on")
-        zone_state = bridge.groups.grouped_light.get(zone_group_id)
-        zone_is_on = zone_state.on.on
-        logging.debug(f"{zone_name} - zone_is_on: {zone_is_on}")
+        group_state = bridge.groups.grouped_light.get(room_group_id)
+        room_is_on = group_state.on.on
 
-        if zone_is_on:
+        if room_is_on:
+            logging.debug(
+                f"time is {time} and lights are on in {room_name} so we're changing the scene")
             await bridge.scenes.recall(scene_id)
 
     except Exception as ex:
-        logging.debug(msg=f"error changing scene in zone", exc_info=ex)
+        logging.debug(msg=f"error changing scene in {room_name}", exc_info=ex)
         return
 
 
@@ -644,41 +699,36 @@ def call_weather_api():
 
 
 # do stuff at certain times
-async def schedules_routine(bridge):
+async def schedules_routine(bridge, input_scheduled_room_names: list):
     # setup
-    global living_area_time_scenes_map
-    try:
-        living_area_group_id = None
-        for group in bridge.groups:
-            if isinstance(group, Zone):
-                if normalize_string(group.metadata.name) == normalize_string("living area"):
-                    living_area_group_id = group.grouped_light
-                    break
+    global rooms_to_time_scenes_map
+    global room_name_to_grouped_light_id_map
 
-    except Exception as ex:
-        logging.debug(msg=f"error setting up schedules routine", exc_info=ex)
-        return
+    # normalize input room names
+    scheduled_room_names = []
+    for room_name in input_scheduled_room_names:
+        scheduled_room_names.append(normalize_string(room_name))
 
     while True:
-        current_datetime_with_timezone = get_current_datetime()
-        current_time = current_datetime_with_timezone.strftime('%H:%M')
-        logging.debug(f"current_time in {my_timezone}: {current_time}")
-
         try:
+            current_datetime_with_timezone = get_current_datetime()
+            current_time = current_datetime_with_timezone.strftime('%H:%M')
+            logging.debug(f"current_time in {my_timezone}: {current_time}")
 
-            if living_area_time_scenes_map is not None:
-
-                scene_id_for_current_time = living_area_time_scenes_map.get(current_time)
-                if scene_id_for_current_time is not None:
-                    await change_zone_scene_at_time_if_lights_on(
-                        bridge,
-                        time=current_time,
-                        zone_name="living area",
-                        zone_group_id=living_area_group_id,
-                        scene_id=scene_id_for_current_time)
-
-            else:
-                logging.debug("Error: living_area_time_scenes_map is None!")
+            for room_name in scheduled_room_names:
+                try:
+                    room_time_scenes_map = rooms_to_time_scenes_map[room_name]
+                    scene_id_for_current_time = room_time_scenes_map.get(current_time)
+                    if scene_id_for_current_time is not None:
+                        room_group_id = room_name_to_grouped_light_id_map[room_name]
+                        await change_zone_scene_at_time_if_lights_on(
+                            bridge,
+                            time=current_time,
+                            room_name=room_name,
+                            room_group_id=room_group_id,
+                            scene_id=scene_id_for_current_time)
+                except Exception as ex:
+                    logging.debug(msg=f"error checking {room_name} in schedules routine", exc_info=ex)
 
         except Exception as ex:
             logging.debug(msg=f"error running schedules", exc_info=ex)
@@ -687,7 +737,10 @@ async def schedules_routine(bridge):
 
 
 def get_current_datetime():
-    return datetime.now(timezone(my_timezone))
+    current_time = datetime.now(timezone(my_timezone))
+    # uncomment for testing
+    # return datetime.strptime("5:12 pm", "%I:%M %p").replace(year=current_time.year, day=current_time.day, month=current_time.month)
+    return current_time
 
 
 def get_sunset_time():
@@ -698,7 +751,7 @@ def get_sunset_time():
             return fetch_sunset_time_from_api()
 
         except Exception as ex:
-            logging.debug(msg="error updating sunset time", exc_info=ex)
+            logging.debug(msg=f"error calling api for sunset time, msg:{ex}")
 
     if sunset_datetime is not None:
         sunset_time = sunset_datetime
@@ -779,7 +832,6 @@ async def utility_off_routine(bridge, utility_room_name):
 
             utility_room_group_state = bridge.groups.grouped_light.get(utility_room_group_id)
             utility_room_is_on = utility_room_group_state.on.on
-            logging.debug(f"{utility_room_name} is on?: {utility_room_is_on}")
 
             if utility_room_is_on:
 
@@ -793,7 +845,7 @@ async def utility_off_routine(bridge, utility_room_name):
 
                 if utility_room_door_opened and utility_room_no_motion:
                     logging.debug(f"turning {utility_room_name} off")
-                    await bridge.groups.grouped_light.set_state(utility_room_group_id, False)
+                    await bridge.groups.grouped_light.set_state(id=utility_room_group_id, on=False)
 
         except Exception as ex:
             logging.debug(msg=f"error checking lights in {utility_room_name} for utility off routine", exc_info=ex)
