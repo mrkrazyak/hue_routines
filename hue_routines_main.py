@@ -817,7 +817,6 @@ async def motion_room_off_routine(bridge):
             global motion_id_to_room_map
             global room_name_to_grouped_light_id_map
             current_datetime = get_current_datetime()
-            logging.debug(f"motion_room_scheduled_off_time_map: {motion_room_scheduled_off_time_map}")
 
             if motion_room_scheduled_off_time_map:
                 scheduled_off_time_map_copy = dict(motion_room_scheduled_off_time_map)
@@ -854,8 +853,8 @@ async def motion_room_off_routine(bridge):
         except Exception as ex:
             logging.debug(msg=f"error checking scheduled times for motion lights off routine", exc_info=ex)
 
-        # run every 2 seconds
-        await asyncio.sleep(2)
+        # run every 3 seconds
+        await asyncio.sleep(3)
 
 
 def get_adjusted_brightness(brightness, brightness_adj):
