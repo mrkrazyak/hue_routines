@@ -48,7 +48,12 @@ scene_start_time_sunset = "Sunset"
 sunset_datetime = None
 last_fetched_sunset_time = None
 
+# {motion_id: [room_name, off_time_seconds, optional_contact_sensor_id]}
 motion_id_to_room_map = None
+# {motion_id: scheduled_off_datetime}
+motion_room_scheduled_off_time_map = None
+
+# {button_id: [room_name, device_name, button_control_id]}
 button_id_to_room_map = None
 
 state = "NY"
@@ -93,17 +98,16 @@ async def main():
             if hue_config.scheduled_scene_change_rooms:
                 tg.create_task(schedules_routine(bridge, scheduled_scene_change_rooms))
             if motion_id_to_room_map:
+                # routine to turn off lights in motion rooms
+                tg.create_task(motion_room_off_routine(bridge))
                 for key_motion_id in motion_id_to_room_map:
+                    # routine to turn on time based scenes in motion rooms
                     bridge.sensors.motion.subscribe(motion_time_based_subscriber,
-                                                    id_filter=key_motion_id,
-                                                    event_filter=EventType.RESOURCE_UPDATED)
+                                                    id_filter=key_motion_id)
             if button_id_to_room_map:
                 for key_button_id in button_id_to_room_map:
                     bridge.sensors.button.subscribe(button_time_based_subscriber,
                                                     id_filter=key_button_id)
-            if utility_off_rooms:
-                for utility_room in utility_off_rooms:
-                    tg.create_task(utility_off_routine(bridge, utility_room))
 
 
 async def update_variables_routine(bridge):
@@ -207,14 +211,6 @@ def update_button_time_based_vars(bridge):
     try:
         if hue_config.button_time_based_rooms:
             button_id_to_room_map = {}
-            rooms = set()
-            for room_name in motion_time_based_rooms:
-                rooms.add(normalize_string(room_name))
-            for motion_sensor in bridge.sensors.motion:
-                sensor_name = normalize_string(bridge.sensors.get_device(id=motion_sensor.id).metadata.name)
-                for room in rooms:
-                    if room in sensor_name:
-                        motion_id_to_room_map[motion_sensor.id] = room
             for button_config in button_time_based_rooms:
                 room_name = normalize_string(button_config[0])
                 device_name = normalize_string(button_config[1])
@@ -238,18 +234,41 @@ def update_button_time_based_vars(bridge):
 
 def update_motion_time_based_vars(bridge):
     global motion_id_to_room_map
+    global motion_room_scheduled_off_time_map
 
     try:
         if hue_config.motion_time_based_rooms:
             motion_id_to_room_map = {}
-            rooms = set()
-            for room_name in motion_time_based_rooms:
-                rooms.add(normalize_string(room_name))
-            for motion_sensor in bridge.sensors.motion:
-                sensor_name = normalize_string(bridge.sensors.get_device(id=motion_sensor.id).metadata.name)
-                for room in rooms:
-                    if room in sensor_name:
-                        motion_id_to_room_map[motion_sensor.id] = room
+            if not motion_room_scheduled_off_time_map:
+                # instantiate if not instantiated
+                motion_room_scheduled_off_time_map = {}
+            for motion_config in motion_time_based_rooms:
+                room_name = normalize_string(motion_config[0])
+                room_off_time_seconds = motion_config[1]
+                motion_id = None
+                optional_contact_id = None
+
+                for motion_sensor in bridge.sensors.motion:
+                    sensor_name = normalize_string(bridge.sensors.get_device(id=motion_sensor.id).metadata.name)
+                    if room_name in sensor_name:
+                        motion_id = motion_sensor.id
+                        break
+                if not motion_id:
+                    logging.debug(f"error: could not find expected motion sensor named for {room_name}")
+                    continue
+
+                for contact_sensor in bridge.sensors.contact:
+                    contact_sensor_name = normalize_string(bridge.sensors.get_device(id=contact_sensor.id).metadata.name)
+                    if room_name in contact_sensor_name:
+                        logging.debug(f"found contact sensor [{contact_sensor_name}] to use for {room_name}")
+                        optional_contact_id = contact_sensor.id
+                        break
+
+                motion_room_info = [room_name, room_off_time_seconds]
+                if optional_contact_id:
+                    motion_room_info.append(optional_contact_id)
+
+                motion_id_to_room_map[motion_id] = motion_room_info
 
     except Exception as ex:
         logging.debug(msg=f"error updating motion time based variables", exc_info=ex)
@@ -476,7 +495,12 @@ async def motion_time_based_subscriber(event_type, item):
         global room_name_to_grouped_light_id_map
         if item.motion.motion:
             motion_id = item.id
-            room_name = motion_id_to_room_map[motion_id]
+            motion_config = motion_id_to_room_map[motion_id]
+            room_name = motion_config[0]
+            off_time_seconds = motion_config[1]
+
+            schedule_motion_lights_off_time(motion_id, off_time_seconds)
+
             room_group_id = room_name_to_grouped_light_id_map[room_name]
             grouped_light = bridge.groups.grouped_light.get(id=room_group_id)
             if not grouped_light.on.on:
@@ -488,31 +512,19 @@ async def motion_time_based_subscriber(event_type, item):
         logging.debug(msg=f"error processing event for time-based motion", exc_info=ex)
 
 
-async def auto_time_scenes_subscriber(event_type, item):
-    global living_area_time_scenes_map
-    global living_area_scene_datetimes_sorted
-    current_datetime = get_current_datetime()
-
+def schedule_motion_lights_off_time(motion_id: str, off_time_seconds: int):
     try:
-        if living_area_time_scenes_map is None or living_area_scene_datetimes_sorted is None:
-            return
+        global motion_room_scheduled_off_time_map
+        if not motion_room_scheduled_off_time_map:
+            motion_room_scheduled_off_time_map = {}
 
-        datetime_after = living_area_scene_datetimes_sorted[0]
-        logging.debug(f"default datetime_after: {datetime_after}")
-        logging.debug(f"current_datetime to compare to sorted scene times: {current_datetime}")
-        for scene_datetime in living_area_scene_datetimes_sorted:
-            if current_datetime >= scene_datetime:
-                datetime_after = scene_datetime
-                logging.debug(f"found new datetime_after: {datetime_after}")
-                break
+        current_datetime = get_current_datetime()
+        scheduled_off_datetime = current_datetime + timedelta(seconds=off_time_seconds)
 
-        datetime_after_string = datetime_after.strftime(hour_min_format)
-        logging.debug(f"datetime_after_string: {datetime_after_string}")
-        current_scene_id = living_area_time_scenes_map.get(datetime_after_string)
-        await bridge.scenes.recall(current_scene_id)
+        motion_room_scheduled_off_time_map[motion_id] = scheduled_off_datetime
 
     except Exception as ex:
-        logging.debug(msg=f"error activating time based scene", exc_info=ex)
+        logging.debug(msg=f"error scheduling next lights off time for motion sensor", exc_info=ex)
 
 
 async def holiday_subscriber(event_type, item):
@@ -794,63 +806,56 @@ def parse_sunset_time_and_update(weather_api_response):
         return None
 
 
-# async def utility_off_subscriber(event_type, item, room_name):
-#     try:
-#         if isinstance(item, Motion):
-#             if item.id == room_motion_id and item.motion.motion_report.motion is False:
-#                 room_door_opened = \
-#                     bridge.sensors.contact.get(
-#                         room_contact_id).contact_report.state == ContactState.NO_CONTACT
-#
-#                 if room_door_opened:
-#                     logging.debug(f"turning utility room: {room_name} off because no motion")
-#                     # await bridge.groups.grouped_light.set_state(group_id, False)
-#     except Exception as ex:
-#         logging.debug(msg=f"error checking {room_name} motion", exc_info=ex)
-
-
-# turn off lights in a room when there is no motion and door is open
-# (need a motion sensor and door contact sensor set up for the room)
-async def utility_off_routine(bridge, utility_room_name):
-    # setup
-    try:
-        utility_room_group_id = ""
-        utility_room_name = normalize_string(utility_room_name)
-        for group in bridge.groups:
-            if isinstance(group, Room):
-                if normalize_string(group.metadata.name) == utility_room_name:
-                    utility_room_group_id = group.grouped_light
-                    break
-
-    except Exception as ex:
-        logging.debug(msg=f"error setting up utility off routine {utility_room_name}", exc_info=ex)
-        return
-
+# turn off lights in a room when there is no motion for some time.
+# time to turn off lights based on motion is scheduled separately and stored in motion_room_scheduled_off_time_map.
+# (if room has a contact/door sensor, lights will only turn off if door is open. if closed, a new off time will
+# be scheduled to check for later)
+async def motion_room_off_routine(bridge):
     while True:
         try:
-            logging.debug(f"checking {utility_room_name} light state")
+            global motion_room_scheduled_off_time_map
+            global motion_id_to_room_map
+            global room_name_to_grouped_light_id_map
+            current_datetime = get_current_datetime()
+            logging.debug(f"motion_room_scheduled_off_time_map: {motion_room_scheduled_off_time_map}")
 
-            utility_room_group_state = bridge.groups.grouped_light.get(utility_room_group_id)
-            utility_room_is_on = utility_room_group_state.on.on
+            if motion_room_scheduled_off_time_map:
+                scheduled_off_time_map_copy = dict(motion_room_scheduled_off_time_map)
+                for motion_id, scheduled_off_datetime in scheduled_off_time_map_copy.items():
 
-            if utility_room_is_on:
+                    motion_config = motion_id_to_room_map[motion_id]
+                    room_name = motion_config[0]
+                    off_time_seconds = motion_config[1]
+                    optional_contact_id = None
+                    if 2 < len(motion_config):
+                        optional_contact_id = motion_config[2]
+                    room_group_id = room_name_to_grouped_light_id_map[room_name]
 
-                utility_room_door_opened = \
-                    bridge.sensors.contact.get(
-                        utility_room_contact_id).contact_report.state == ContactState.NO_CONTACT
-                utility_room_no_motion = \
-                    bridge.sensors.motion.get(utility_room_motion_id).motion.motion_report.motion is False
-                logging.debug(f"{utility_room_name} door is open?: {utility_room_door_opened}")
-                logging.debug(f"{utility_room_name} has no motion?: {utility_room_no_motion}")
+                    if current_datetime < scheduled_off_datetime:
+                        # not scheduled off time yet, pass
+                        continue
 
-                if utility_room_door_opened and utility_room_no_motion:
-                    logging.debug(f"turning {utility_room_name} off")
-                    await bridge.groups.grouped_light.set_state(id=utility_room_group_id, on=False)
+                    if bridge.sensors.motion.get(motion_id).motion.motion:
+                        # there is motion, don't turn lights off and schedule new off time
+                        schedule_motion_lights_off_time(motion_id, off_time_seconds)
+                        continue
+
+                    if optional_contact_id and bridge.sensors.contact.get(
+                                optional_contact_id).contact_report.state == ContactState.CONTACT:
+                        # door is closed, don't turn lights off and schedule new off time
+                        schedule_motion_lights_off_time(motion_id, off_time_seconds)
+                        continue
+
+                    # now turn lights off and remove scheduled off time
+                    logging.debug(f"turning {room_name} off since no motion")
+                    await bridge.groups.grouped_light.set_state(id=room_group_id, on=False)
+                    del motion_room_scheduled_off_time_map[motion_id]
 
         except Exception as ex:
-            logging.debug(msg=f"error checking lights in {utility_room_name} for utility off routine", exc_info=ex)
+            logging.debug(msg=f"error checking scheduled times for motion lights off routine", exc_info=ex)
 
-        await asyncio.sleep(utility_room_update_time_secs)
+        # run every 2 seconds
+        await asyncio.sleep(2)
 
 
 def get_adjusted_brightness(brightness, brightness_adj):
