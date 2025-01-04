@@ -38,6 +38,7 @@ weather_group_name = "weather"
 weather_group_id = None
 weather_id = None
 weather_scene_map = None
+temp_sensor_map = None
 
 hour_min_format = "%H:%M"
 
@@ -56,12 +57,40 @@ motion_room_scheduled_off_time_map = None
 # {button_id: [room_name, device_name, button_control_id]}
 button_id_to_room_map = None
 
-state = "NY"
+# change if you want to use different state-specific holidays
+holiday_state = "NY"
 holiday_group_id = None
 holiday_id = None
 holiday_scene_map = dict()
 holiday_last_on_datetime = None
-us_and_state_holidays = CustomHolidays(subdiv=state, observed=False)
+us_and_state_holidays = CustomHolidays(subdiv=holiday_state, observed=False)
+
+holiday_zone_name = "holiday"
+
+# weather temperature scene names
+weather_temp_colder_scene = "colder"
+weather_temp_same_scene = "same"
+weather_temp_hotter_scene = "hotter"
+weather_temp_freezing_scene = "freezing"
+
+# DEFAULTS #
+# You can adjust these variables in a separate hue_config.py file by creating a variable
+# in that file with the same name but without '_default` at the end.
+
+# this is the fallback sunset time if we can't get sunset data
+# 8pm
+fallback_sunset_hour_default = 20
+fallback_sunset_minute_default = 00
+
+my_timezone_default = "US/Eastern"
+
+weather_update_time_secs_default = 60 * 5  # minutes
+weather_transition_time_ms_default = 1000 * 3  # seconds
+
+# temperate range to determine outside temp difference
+weather_temp_diff_range_default = 5  # degrees Fahrenheit
+
+holiday_scene_check_interval_hours_default = 1
 
 
 async def main():
@@ -79,35 +108,54 @@ async def main():
         global bridge
 
         # check if certain features are enabled in hue_config.py
-        if "utility_off_rooms" in globals():
-            global utility_off_rooms
-        else:
-            utility_off_rooms = None
+        scheduled_scene_change_rooms = find_hue_config_var("scheduled_scene_change_rooms")
+
+        global weather_group_id
 
         bridge = b
         logging.debug(f"Connected to bridge: {bridge.bridge_id}")
 
         update_vars(bridge)
 
-        bridge.subscribe(holiday_subscriber)
-
         # run all routines in background continuously
         async with asyncio.TaskGroup() as tg:
+            # routine to update program variables every so often
             tg.create_task(update_variables_routine(bridge))
-            tg.create_task(weather_light_routine(bridge))
-            if hue_config.scheduled_scene_change_rooms:
+
+            if holiday_group_id:
+                # routine to change lights on holidays
+                bridge.groups.subscribe(callback=holiday_subscriber, id_filter=holiday_group_id)
+            if weather_group_id:
+                # routine to change lights depending on weather
+                tg.create_task(weather_light_routine(bridge))
+            if scheduled_scene_change_rooms:
+                # routine to switch over scenes at certain times when lights are on
                 tg.create_task(schedules_routine(bridge, scheduled_scene_change_rooms))
             if motion_id_to_room_map:
                 # routine to turn off lights in motion rooms
                 tg.create_task(motion_room_off_routine(bridge))
                 for key_motion_id in motion_id_to_room_map:
                     # routine to turn on time based scenes in motion rooms
-                    bridge.sensors.motion.subscribe(motion_time_based_subscriber,
+                    bridge.sensors.motion.subscribe(callback=motion_time_based_subscriber,
                                                     id_filter=key_motion_id)
             if button_id_to_room_map:
+                # routine to turn on time based scenes with a button/switch
                 for key_button_id in button_id_to_room_map:
-                    bridge.sensors.button.subscribe(button_time_based_subscriber,
+                    bridge.sensors.button.subscribe(callback=button_time_based_subscriber,
                                                     id_filter=key_button_id)
+
+
+def find_hue_config_var(var_name: str):
+    """
+    Tries to find variable by the supplied name in a separate config file and returns the value if found.
+    If not found, returns None.
+    :param var_name: the variable name to look for
+    :return: the value of the variable if found, otherwise returns None
+    """
+    var = None
+    if var_name in globals():
+        var = globals()[var_name]
+    return var
 
 
 async def update_variables_routine(bridge):
@@ -156,6 +204,10 @@ def update_time_based_scene_map_vars(bridge):
     room_name_to_type_map = {}
     rooms_to_time_scenes_map = {}
     rooms_to_time_scene_datetimes_sorted_map = {}
+
+    my_timezone = find_hue_config_var("my_timezone")
+    if not my_timezone:
+        my_timezone = my_timezone_default
 
     for group in bridge.groups:
         # setup auto time-based scenes for room
@@ -206,7 +258,8 @@ def update_button_time_based_vars(bridge):
     global button_id_to_room_map
 
     try:
-        if hue_config.button_time_based_rooms:
+        button_time_based_rooms = find_hue_config_var("button_time_based_rooms")
+        if button_time_based_rooms:
             button_id_to_room_map = {}
             for button_config in button_time_based_rooms:
                 room_name = normalize_string(button_config[0])
@@ -234,7 +287,8 @@ def update_motion_time_based_vars(bridge):
     global motion_room_scheduled_off_time_map
 
     try:
-        if hue_config.motion_time_based_rooms:
+        motion_time_based_rooms = find_hue_config_var("motion_time_based_rooms")
+        if motion_time_based_rooms:
             motion_id_to_room_map = {}
             if not motion_room_scheduled_off_time_map:
                 # instantiate if not instantiated
@@ -255,7 +309,8 @@ def update_motion_time_based_vars(bridge):
                     continue
 
                 for contact_sensor in bridge.sensors.contact:
-                    contact_sensor_name = normalize_string(bridge.sensors.get_device(id=contact_sensor.id).metadata.name)
+                    contact_sensor_name = normalize_string(
+                        bridge.sensors.get_device(id=contact_sensor.id).metadata.name)
                     if room_name in contact_sensor_name:
                         logging.debug(f"found contact sensor [{contact_sensor_name}] to use for {room_name}")
                         optional_contact_id = contact_sensor.id
@@ -292,6 +347,7 @@ def update_weather_vars(bridge):
     global weather_id
     global weather_scene_map
     global weather_group_name
+    global temp_sensor_map
 
     try:
         for group in bridge.groups:
@@ -312,6 +368,20 @@ def update_weather_vars(bridge):
             weather_scene_map[scene_name] = scene_id
 
         logging.debug(f"weather_scene_map: {weather_scene_map}")
+
+        for temp_sensor in bridge.sensors.temperature:
+            if not temp_sensor.enabled:
+                continue
+            if temp_sensor_map is None:
+                temp_sensor_map = {}
+            temp_sensor_device = bridge.devices.get(id=temp_sensor.owner.rid)
+            if temp_sensor_device.metadata and temp_sensor_device.metadata.name:
+                temp_name = normalize_string(temp_sensor_device.metadata.name)
+                temp_sensor_map[temp_name] = temp_sensor.id
+
+        if temp_sensor_map:
+            logging.debug(f"temp_sensor_map: {temp_sensor_map}")
+
 
     except Exception as ex:
         logging.debug(msg=f"error updating weather variables", exc_info=ex)
@@ -533,8 +603,13 @@ async def holiday_subscriber(event_type, item):
             current_datetime = get_current_datetime()
             global holiday_last_on_datetime
 
+            holiday_scene_check_interval_hours = find_hue_config_var("holiday_scene_check_interval_hours")
+            if not holiday_scene_check_interval_hours:
+                holiday_scene_check_interval_hours = holiday_scene_check_interval_hours_default
+
             if (holiday_last_on_datetime is None
-                    or holiday_last_on_datetime <= current_datetime - timedelta(hours=holiday_scene_interval_hours)):
+                    or holiday_last_on_datetime <= current_datetime - timedelta(
+                        hours=holiday_scene_check_interval_hours)):
 
                 update_holiday_scenes()
 
@@ -568,6 +643,18 @@ async def weather_light_routine(bridge):
             if not weather_scene_map:
                 return
 
+            weather_update_time_secs = find_hue_config_var("weather_update_time_secs")
+            if not weather_update_time_secs:
+                weather_update_time_secs = weather_update_time_secs_default
+
+            weather_temp_diff_range = find_hue_config_var("weather_temp_diff_range")
+            if not weather_temp_diff_range:
+                weather_temp_diff_range = weather_temp_diff_range_default
+
+            weather_transition_time_ms = find_hue_config_var("weather_transition_time_ms")
+            if not weather_transition_time_ms:
+                weather_transition_time_ms = weather_transition_time_ms_default
+
             default_scene_id = weather_scene_map.get("default")
 
             # if weather scene isn't on, don't do anything
@@ -577,7 +664,6 @@ async def weather_light_routine(bridge):
 
             if weather_zone_is_on:
                 prev_weather_zone_brightness = weather_zone_state.dimming.brightness
-                logging.debug(f"weather_zone_brightness: {prev_weather_zone_brightness}")
 
                 weather_api_response = call_weather_api()
                 parse_sunset_time_and_update(weather_api_response)
@@ -590,12 +676,14 @@ async def weather_light_routine(bridge):
                     inside_temp = get_inside_temp_in_f(bridge)
                     # feels like temp
                     outside_temp = weather_api_response.json().get("main").get("feels_like")
+                    logging.debug(f"inside temp: {inside_temp}")
                     logging.debug(f"outside temp: {outside_temp}")
 
                     upper_range = inside_temp + weather_temp_diff_range
                     lower_range = inside_temp - weather_temp_diff_range
                     freezing_temp = 32
-                    if outside_temp <= freezing_temp:
+                    # check if there is a freezing scene first
+                    if outside_temp <= freezing_temp and weather_scene_map.get(weather_temp_freezing_scene) is not None:
                         logging.debug(f"outside temp is lower than freezing_temp: {freezing_temp}")
                         temp_scene = weather_temp_freezing_scene
                     elif outside_temp < lower_range:
@@ -647,31 +735,26 @@ async def weather_light_routine(bridge):
 
 
 def get_inside_temp_in_f(bridge):
-    # log all temps
-    if logging.getLogger().isEnabledFor(logging.DEBUG):
-        try:
-            front_temp_obj = bridge.sensors.temperature.get(front_temp_id)
-            front_temp_f = celsius_to_fahrenheit(front_temp_obj.temperature.temperature)
-            logging.debug(f"front temp: {front_temp_f}"
-                          f" - time: {front_temp_obj.temperature.temperature_report.changed}")
-        except Exception as ex:
-            logging.debug(msg=f"error getting front temp", exc_info=ex)
+    global temp_sensor_map
 
-        try:
-            bathroom_temp_obj = bridge.sensors.temperature.get(bathroom_temp_id)
-            bathroom_temp_f = celsius_to_fahrenheit(bathroom_temp_obj.temperature.temperature)
-            logging.debug(f"bathroom temp: {bathroom_temp_f}"
-                          f" - time: {bathroom_temp_obj.temperature.temperature_report.changed}")
-        except Exception as ex:
-            logging.debug(msg=f"error getting bathroom temp", exc_info=ex)
+    if not temp_sensor_map:
+        raise Exception("temp_sensor_map is empty")
 
-    # return temp from living room
-    living_room_temp_obj = bridge.sensors.temperature.get(living_room_temp_id)
-    living_room_temp_f = celsius_to_fahrenheit(living_room_temp_obj.temperature.temperature)
-    logging.debug(f"living temp: {living_room_temp_f}"
-                  f" - time: {living_room_temp_obj.temperature.temperature_report.changed}")
+    temperature_difference_sensor_name = find_hue_config_var("temperature_difference_sensor_name")
+    if temperature_difference_sensor_name:
+        temperature_difference_sensor_name = normalize_string(temperature_difference_sensor_name)
 
-    return living_room_temp_f
+    temp_to_return = None
+
+    for temp_name, temp_id in temp_sensor_map.items():
+        sensor_temp_obj = bridge.sensors.temperature.get(temp_id)
+        sensor_temp_f = celsius_to_fahrenheit(sensor_temp_obj.temperature.temperature)
+        logging.debug(f"{temp_name} temp: {sensor_temp_f}"
+                      f" - time: {sensor_temp_obj.temperature.temperature_report.changed}")
+        if not temperature_difference_sensor_name or temperature_difference_sensor_name == temp_name:
+            temp_to_return = sensor_temp_f
+
+    return temp_to_return
 
 
 def celsius_to_fahrenheit(temp_celsius: float) -> float:
@@ -698,9 +781,18 @@ async def change_zone_scene_at_time_if_lights_on(bridge, time, room_name, room_g
 
 
 def call_weather_api():
+    weather_api_key = find_hue_config_var("weather_api_key")
+    if not weather_api_key:
+        raise Exception("Trying to call weather api but 'weather_api_key' is undefined, please add variable to "
+                        "config file")
+    weather_city_name = find_hue_config_var("weather_city_name")
+    if not weather_city_name:
+        raise Exception("Trying to call weather api but 'weather_city_name' is undefined, please add variable to "
+                        "config file")
+
     response = requests.get(
         "https://api.openweathermap.org/data/2.5/weather"
-        f"?q={city_name}"
+        f"?q={weather_city_name}"
         f"&appid={weather_api_key}"
         "&units=imperial")
     response.raise_for_status()
@@ -746,6 +838,10 @@ async def schedules_routine(bridge, input_scheduled_room_names: list):
 
 
 def get_current_datetime():
+    my_timezone = find_hue_config_var("my_timezone")
+    if not my_timezone:
+        my_timezone = my_timezone_default
+
     current_time = datetime.now(timezone(my_timezone))
     # uncomment for testing
     # return datetime.strptime("5:12 pm", "%I:%M %p").replace(year=current_time.year, day=current_time.day, month=current_time.month)
@@ -754,19 +850,29 @@ def get_current_datetime():
 
 def get_sunset_time():
     global sunset_datetime
+    fallback_sunset_hour = find_hue_config_var("fallback_sunset_hour")
+    if not fallback_sunset_hour:
+        fallback_sunset_hour = fallback_sunset_hour_default
+
+    fallback_sunset_minute = find_hue_config_var("fallback_sunset_minute")
+    if not fallback_sunset_minute:
+        fallback_sunset_minute = fallback_sunset_minute_default
+
     if sunset_datetime is None \
             or sunset_datetime.date() != get_current_datetime().date():
         try:
-            return fetch_sunset_time_from_api()
+            fetched_time = fetch_sunset_time_from_api()
+            if fetched_time:
+                return fetched_time
 
         except Exception as ex:
-            logging.debug(msg=f"error calling api for sunset time, msg:{ex}")
+            logging.debug(msg=f"ERROR calling api for sunset time, msg: {ex}")
 
     if sunset_datetime is not None:
         sunset_time = sunset_datetime
     else:
-        sunset_time = datetime.today().replace(hour=evening_scene_switchover_fallback_hour,
-                                               minute=evening_scene_switchover_fallback_minute)
+        sunset_time = datetime.today().replace(hour=fallback_sunset_hour,
+                                               minute=fallback_sunset_minute)
     return sunset_time
 
 
@@ -786,11 +892,16 @@ def fetch_sunset_time_from_api():
         else:
             raise Exception("Error calling weather api/parsing response")
     else:
-        raise Exception(f"Not calling api again, last called time: {last_fetched_sunset_time}")
+        # api was already called recently, don't call again
+        return None
 
 
 def parse_sunset_time_and_update(weather_api_response):
     global sunset_datetime
+    my_timezone = find_hue_config_var("my_timezone")
+    if not my_timezone:
+        my_timezone = my_timezone_default
+
     try:
         if sunset_datetime is None \
                 or sunset_datetime.date() != get_current_datetime().date():
@@ -837,7 +948,7 @@ async def motion_room_off_routine(bridge):
                         continue
 
                     if optional_contact_id and bridge.sensors.contact.get(
-                                optional_contact_id).contact_report.state == ContactState.CONTACT:
+                            optional_contact_id).contact_report.state == ContactState.CONTACT:
                         # door is closed, don't turn lights off and schedule new off time
                         schedule_motion_lights_off_time(motion_id, off_time_seconds)
                         continue
