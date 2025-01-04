@@ -183,7 +183,6 @@ def update_time_based_scene_map_vars(bridge):
             add_scene_to_time_map(room_time_scenes_map, scene_name, scene.id)
 
         if room_time_scenes_map is not None and len(room_time_scenes_map) != 0:
-            logging.debug(f"{room_name} updated room_time_scenes_map : {room_time_scenes_map}")
             # setup sorted scene datetimes to be used for time-based scenes
             current_datetime = get_current_datetime()
             room_scene_datetimes_sorted = []
@@ -196,12 +195,10 @@ def update_time_based_scene_map_vars(bridge):
                 scene_datetime = tz.localize(scene_datetime)
                 room_scene_datetimes_sorted.append(scene_datetime)
             room_scene_datetimes_sorted.sort(reverse=True)
-            logging.debug(f"{room_name} sorted datetimes: {room_scene_datetimes_sorted}")
 
             # set time based scenes for room in global map
             rooms_to_time_scenes_map[room_name] = room_time_scenes_map
             rooms_to_time_scene_datetimes_sorted_map[room_name] = room_scene_datetimes_sorted
-    logging.debug(f"updated rooms_to_time_scenes_map: {rooms_to_time_scenes_map}")
     logging.debug(f"updated rooms_to_time_scene_datetimes_sorted_map: {rooms_to_time_scene_datetimes_sorted_map}")
 
 
@@ -726,7 +723,6 @@ async def schedules_routine(bridge, input_scheduled_room_names: list):
         try:
             current_datetime_with_timezone = get_current_datetime()
             current_time = current_datetime_with_timezone.strftime('%H:%M')
-            logging.debug(f"current_time in {my_timezone}: {current_time}")
 
             for room_name in scheduled_room_names:
                 try:
