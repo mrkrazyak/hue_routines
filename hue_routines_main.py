@@ -632,7 +632,8 @@ async def weather_light_routine(bridge):
                     if default_scene_id is not None:
                         scene_id = default_scene_id
 
-                if scene_id is not None:
+                # if scene_id was found and weather zone is still on
+                if scene_id is not None and bridge.groups.grouped_light.get(weather_group_id).on.on:
                     # refetch current light brightness in case it was changed in the meantime
                     prev_weather_zone_brightness = bridge.groups.grouped_light.get(weather_group_id).dimming.brightness
                     # turn on correct weather scene
