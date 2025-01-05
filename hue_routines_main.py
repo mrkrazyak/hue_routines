@@ -8,7 +8,6 @@ from datetime import datetime, timedelta
 
 import requests
 from aiohue import HueBridgeV2
-from aiohue.v2 import EventType
 from aiohue.v2.models.button import ButtonEvent
 from aiohue.v2.models.contact import ContactState
 from aiohue.v2.models.grouped_light import GroupedLight
@@ -17,7 +16,6 @@ from aiohue.v2.models.room import Room
 from aiohue.v2.models.zone import Zone
 from pytz import timezone
 
-import hue_config
 from custom_holidays import CustomHolidays
 from hue_config import *
 
@@ -114,25 +112,38 @@ async def main():
 
         bridge = b
         logging.debug(f"Connected to bridge: {bridge.bridge_id}")
+        logging.debug("--- RUNNING SETUP ---")
 
         update_vars(bridge)
 
         # run all routines in background continuously
         async with asyncio.TaskGroup() as tg:
+            logging.debug("--- Creating configured routines ---")
             # routine to update program variables every so often
+            logging.debug("Creating variable update routine")
             tg.create_task(update_variables_routine(bridge))
 
             if holiday_group_id:
+                logging.debug("Creating subscriber for holiday lights")
+                logging.debug("-----------------------------------")
+                logging.debug("Holidays you can create scenes for:")
+                us_and_state_holidays.get(get_current_datetime().strftime('%Y-%m-%d'))
+                for date, holiday in sorted(us_and_state_holidays.items()):
+                    logging.debug(f"{date} - {holiday}")
+                logging.debug("-----------------------------------")
                 # routine to change lights on holidays
                 bridge.groups.subscribe(callback=holiday_subscriber, id_filter=holiday_group_id)
             if weather_group_id:
                 # routine to change lights depending on weather
+                logging.debug("Creating weather light routine")
                 tg.create_task(weather_light_routine(bridge))
             if scheduled_scene_change_rooms:
                 # routine to switch over scenes at certain times when lights are on
+                logging.debug("Creating schedules routine for configured rooms")
                 tg.create_task(schedules_routine(bridge, scheduled_scene_change_rooms))
             if motion_id_to_room_map:
                 # routine to turn off lights in motion rooms
+                logging.debug("Creating on/off routines for motion sensors")
                 tg.create_task(motion_room_off_routine(bridge))
                 for key_motion_id in motion_id_to_room_map:
                     # routine to turn on time based scenes in motion rooms
@@ -140,9 +151,11 @@ async def main():
                                                     id_filter=key_motion_id)
             if button_id_to_room_map:
                 # routine to turn on time based scenes with a button/switch
+                logging.debug("Creating subscribers for configured switches to activate time-based scenes ")
                 for key_button_id in button_id_to_room_map:
                     bridge.sensors.button.subscribe(callback=button_time_based_subscriber,
                                                     id_filter=key_button_id)
+            logging.debug("--- SETUP DONE ---")
 
 
 def find_hue_config_var(var_name: str):
