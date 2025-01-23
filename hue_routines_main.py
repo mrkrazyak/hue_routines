@@ -82,6 +82,8 @@ fallback_sunset_minute_default = 00
 
 my_timezone_default = "US/Eastern"
 
+variable_update_time_mins_default = 5
+
 weather_update_time_secs_default = 60 * 5  # minutes
 weather_transition_time_ms_default = 1000 * 3  # seconds
 
@@ -172,8 +174,11 @@ def find_hue_config_var(var_name: str):
 
 
 async def update_variables_routine(bridge):
+    variable_update_time_mins = find_hue_config_var("variable_update_time_mins")
+    if not variable_update_time_mins:
+        variable_update_time_mins = variable_update_time_mins_default
     while True:
-        await asyncio.sleep(60 * 15)  # update every 15 mins
+        await asyncio.sleep(60 * variable_update_time_mins)
         update_vars(bridge)
 
 
