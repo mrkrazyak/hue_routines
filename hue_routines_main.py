@@ -4,9 +4,14 @@ import argparse
 import asyncio
 import contextlib
 import logging
-from datetime import datetime, timedelta
-
+import os
 import requests
+import urllib3
+
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+from pytz import timezone
+
 from aiohue import HueBridgeV2
 from aiohue.v2.models.button import ButtonEvent
 from aiohue.v2.models.contact import ContactState
@@ -14,7 +19,6 @@ from aiohue.v2.models.grouped_light import GroupedLight
 from aiohue.v2.models.resource import ResourceTypes
 from aiohue.v2.models.room import Room
 from aiohue.v2.models.zone import Zone
-from pytz import timezone
 
 from custom_holidays import CustomHolidays
 from hue_config import *
@@ -39,6 +43,9 @@ weather_scene_map = None
 temp_sensor_map = None
 
 hour_min_format = "%H:%M"
+am_pm_format = '%-I:%M%p'
+# on windows, you need # instead of - to stip leading 0 from time
+am_pm_format_windows = '%#I:%M%p'
 
 rooms_to_time_scenes_map = None
 rooms_to_time_scene_datetimes_sorted_map = None
@@ -91,6 +98,8 @@ weather_transition_time_ms_default = 1000 * 3  # seconds
 weather_temp_diff_range_default = 5  # degrees Fahrenheit
 
 holiday_scene_check_interval_hours_default = 1
+
+hue_v2_base_url = f"https://{bridge_ip}/clip/v2"
 
 
 async def main():
@@ -416,6 +425,8 @@ def add_scene_to_time_map(time_scenes_map, scene_name, scene_id):
             if normalize_string(scene_start_time_sunset) in scene_start_time:
                 # start time in scene name uses sunset offset time
                 scene_start_datetime = parse_sunset_offset_time_from_scene_name(scene_start_time)
+                # try adding start time to end of scene name
+                try_adding_start_time_to_scene_name(scene_id, scene_name, scene_start_datetime)
             else:
                 # start time in scene name is in hour:min am/pm format
                 normalized_scene_start_time = normalize_am_pm_time(scene_start_time)
@@ -429,6 +440,36 @@ def add_scene_to_time_map(time_scenes_map, scene_name, scene_id):
         logging.debug(msg=f"error parsing scene name:{scene_name} when adding to time scenes map", exc_info=ex)
         return
 
+# For scenes that are adjusted based on sunset time, add the actual time that scene will be activated
+# to the end of the scene name, within []
+def try_adding_start_time_to_scene_name(scene_id: str, original_scene_name: str, start_datetime: datetime):
+    try:
+        # if running on windows
+        time_format = am_pm_format_windows if os.name == 'nt' else am_pm_format
+        start_time = start_datetime.strftime(time_format)
+        left_bracket_split = original_scene_name.split('[')
+        right_bracket_split = original_scene_name.split(']')
+        name_start = left_bracket_split[0]
+        name_end = ''
+        if len(right_bracket_split) > 1:
+            name_end = right_bracket_split[1]
+
+        new_scene_name = f"{name_start}[{start_time}]{name_end}"
+        logging.debug(f'new_scene_name with time added: {new_scene_name}')
+        if original_scene_name == new_scene_name:
+            logging.debug(f'scene start time hasn\'t changed, not updating scene name: {original_scene_name}')
+            return
+
+        url = f'{hue_v2_base_url}/resource/scene/{scene_id}'
+        headers = {'hue-application-key': hue_app_key}
+        data = f'{{"metadata": {{"name": "{new_scene_name}"}} }}'
+
+        with disable_ssl_warnings():
+            response = requests.put(url=url, data=data, headers=headers, verify=False)
+            response.raise_for_status()
+
+    except Exception as ex:
+        logging.debug(msg=f"error adding start time to scene name:{original_scene_name}", exc_info=ex)
 
 def parse_sunset_offset_time_from_scene_name(scene_start_time: str):
     scene_start_datetime = get_sunset_time()
@@ -999,6 +1040,15 @@ def normalize_holiday_name(holiday):
 
 def normalize_string(input_string: str):
     return input_string.lower().replace(" ", "")
+
+
+@contextmanager
+def disable_ssl_warnings():
+    import warnings
+
+    with warnings.catch_warnings():
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        yield None
 
 
 with contextlib.suppress(KeyboardInterrupt):
