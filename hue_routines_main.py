@@ -499,7 +499,7 @@ def parse_sunset_offset_time_from_scene_name(scene_start_time: str):
     if index == 0 or index == len(offset):
         raise Exception(f"could not find time unit 'h' or 'm' in offset: {offset}")
 
-    offset_amount = int(offset[:index])
+    offset_amount = float(offset[:index])
     if not is_positive_offset:
         offset_amount = -offset_amount
     if offset[index] == "h":
